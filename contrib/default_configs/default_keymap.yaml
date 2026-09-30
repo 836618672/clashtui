@@ -106,7 +106,15 @@ file:
     - on: "e"
       action:
         Action: Edit
-      desc: Edit
+      desc: Edit subscription
+    - on: "E"
+      action:
+        Action: EditFile
+      desc: Edit config file
+    - on: "<Esc>"
+      action:
+        Action: ClearFilter
+      desc: Clear filter
     - on: "p"
       action:
         Action: Preview
@@ -149,12 +157,12 @@ file:
       desc: Toggle no proxy-provider
     - on: "n"
       action:
-        Action: TrafficNext
-      desc: Traffic display next
-    - on: "N"
+        Action: Traffic
+      desc: Show traffic
+    - on: "O"
       action:
-        Action: TrafficPrev
-      desc: Traffic display prev
+        Action: ToggleUpdateWithProxy
+      desc: Toggle update with proxy
 
   template:
     - on: "<Left>"

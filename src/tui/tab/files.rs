@@ -21,8 +21,8 @@ macro_rules! sync {
 macro_rules! get_name {
     ($self:expr, $state:expr) => {
         if let Some(idx) = $state.selected() {
-            if idx < $self.items.len() {
-                $self.items[idx].clone()
+            if let Some(name) = visible_items(&$self.items, $self.filter.as_deref()).nth(idx) {
+                name.clone()
             } else {
                 return false;
             }
@@ -30,6 +30,55 @@ macro_rules! get_name {
             return false;
         }
     };
+}
+
+fn visible_items<'a>(
+    items: &'a [String],
+    filter: Option<&'a str>,
+) -> impl Iterator<Item = &'a String> {
+    items
+        .iter()
+        .filter(move |name| filter.is_none_or(|pat| name.contains(pat)))
+}
+
+fn clamp_selection(state: &mut ListState, len: usize) {
+    state.select(if len == 0 {
+        None
+    } else {
+        Some(state.selected().unwrap_or(0).min(len - 1))
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filtered_actions_use_the_visible_row_not_the_unfiltered_index() {
+        struct Content {
+            items: Vec<String>,
+            filter: Option<String>,
+        }
+        fn selected(content: &Content, state: &ListState, result: &mut Option<String>) -> bool {
+            let name = get_name!(content, state);
+            *result = Some(name);
+            true
+        }
+        let content = Content {
+            items: vec!["alpha".into(), "beta".into(), "beta-2".into()],
+            filter: Some("beta".into()),
+        };
+        let mut state = ListState::default();
+        clamp_selection(&mut state, 2);
+        let mut result = None;
+        assert!(selected(&content, &state, &mut result));
+        assert_eq!(result.as_deref(), Some("beta"));
+        state.select(Some(1));
+        assert!(selected(&content, &state, &mut result));
+        assert_eq!(result.as_deref(), Some("beta-2"));
+        clamp_selection(&mut state, 0);
+        assert!(!selected(&content, &state, &mut result));
+    }
 }
 
 pub(crate) mod profile;

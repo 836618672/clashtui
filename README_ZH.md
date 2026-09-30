@@ -167,6 +167,7 @@ launchctl load -w ~/Library/LaunchAgents/clashtui_singbox.plist
 | [手动安装](docs/install_manually_zh.md) | system/user 模式手动安装步骤 |
 | [功能设计](docs/ClashTui_feature_design_zh.md) | 功能设计文档：配置结构、订阅管理、Template 展开、sing-box 合并算法 |
 | [架构](docs/architecture_zh.md) | 代码架构文档：模块结构、启动流程、TUI 事件循环、Tab 体系 |
+| [TUI 订阅编辑问题与项目背景](docs/tui_profile_edit_background_zh.md) | Files 页面快捷键排查、根因、当前修改与验证记录 |
 | [开发约定](docs/development_conventions.md) | 分支命名、提交规范、CHANGELOG 约定 |
 
 ## 参与开发

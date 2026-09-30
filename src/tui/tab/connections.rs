@@ -222,12 +222,10 @@ fn make_display_rows(
                 } else {
                     c.metadata.remote_destination.clone()
                 }
+            } else if !port.is_empty() && port != "0" {
+                format!("{host}:{port}")
             } else {
-                if !port.is_empty() && port != "0" {
-                    format!("{host}:{port}")
-                } else {
-                    host
-                }
+                host
             };
 
             let rule = c.rule.as_deref().unwrap_or("-");

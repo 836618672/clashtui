@@ -68,12 +68,10 @@ pub fn render(content: &Proxies, f: &mut Frame, area: Rect, state: &mut ListStat
                 .position(|&i| i >= current)
                 .or_else(|| Some(filtered_indices.len().saturating_sub(1)))
         }
+    } else if current >= all_nodes.len() {
+        None
     } else {
-        if current >= all_nodes.len() {
-            None
-        } else {
-            Some(current)
-        }
+        Some(current)
     };
 
     // Build footer

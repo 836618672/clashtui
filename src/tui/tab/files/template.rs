@@ -23,6 +23,11 @@ mod_agent!(
         ),
         ([KeyCode::Char('e')], Key::Action(Action::Edit), "Edit"),
         (
+            [KeyCode::Esc],
+            Key::Action(Action::ClearFilter),
+            "Clear filter"
+        ),
+        (
             [KeyCode::Char('E')],
             Key::Action(Action::EditProviders),
             "Edit proxy providers"
@@ -123,6 +128,7 @@ impl<'de> serde::Deserialize<'de> for Key {
                         "Generate" => Ok(Key::Action(Action::Generate)),
                         "Delete" => Ok(Key::Action(Action::Delete)),
                         "Edit" => Ok(Key::Action(Action::Edit)),
+                        "ClearFilter" => Ok(Key::Action(Action::ClearFilter)),
                         "EditProviders" => Ok(Key::Action(Action::EditProviders)),
                         "Preview" => Ok(Key::Action(Action::Preview)),
                         "Search" => Ok(Key::Action(Action::Search)),
@@ -159,6 +165,7 @@ pub enum Action {
     Generate,
     Delete,
     Edit,
+    ClearFilter,
     EditProviders,
     Preview,
     Search,
@@ -233,7 +240,10 @@ impl DualTabContentMate for Template {
             Key::MoveDown => state.select_next(),
             Key::MoveUp => state.select_previous(),
 
-            Key::Select => todo!(),
+            Key::Select => {
+                let name = get_name!(self, state);
+                Action::Generate.act(name).spawn_at(task_set);
+            }
 
             Key::Action(action) => {
                 log::debug!("Template::Action: {action:?}");
@@ -241,13 +251,19 @@ impl DualTabContentMate for Template {
                     Action::GoTop => state.select_first(),
                     Action::GoEnd => state.select_last(),
                     Action::FzfFind => {
-                        let items = self.items.clone();
+                        let items = visible_items(&self.items, self.filter.as_deref())
+                            .cloned()
+                            .collect();
                         actions::fzf_find(items).spawn_at(task_set);
                         return false;
                     }
-                    Action::EditProviders => {
+                    Action::Search => {
                         action.act(String::new()).spawn_at(task_set);
                         return false;
+                    }
+                    Action::ClearFilter => {
+                        self.filter = None;
+                        state.select_first();
                     }
                     _ => {
                         let name = get_name!(self, state);
@@ -266,20 +282,12 @@ impl DualTabContentMate for Template {
             state.select(Some(idx));
         }
 
-        // Clamp cursor to valid range
-        if let Some(idx) = state.selected() {
-            if self.items.is_empty() {
-                state.select(None);
-            } else if idx >= self.items.len() {
-                state.select(Some(self.items.len().saturating_sub(1)));
-            }
-        } else if !self.items.is_empty() {
-            state.select(Some(0));
-        }
+        let visible_count = visible_items(&self.items, self.filter.as_deref()).count();
+        clamp_selection(state, visible_count);
 
         let theme = Theme::get();
         let section = theme.section("file");
-        let unfocused_border = section.border.fg(Color::Rgb(100, 100, 100));
+        let unfocused_border = section.muted;
         let unfocused_highlight = Style::new();
 
         let block = Block::bordered()
@@ -288,26 +296,44 @@ impl DualTabContentMate for Template {
             } else {
                 unfocused_border
             })
-            .title(Self::TITLE);
+            .title(format!(
+                " {}Templates ({visible_count}) ",
+                if is_focused { "> " } else { "" }
+            ))
+            .title_bottom(
+                Line::raw(format!(
+                    " {}/{} ",
+                    state.selected().map_or(0, |i| i + 1),
+                    visible_count
+                ))
+                .right_aligned(),
+            );
 
         let block = if let Some(filter) = self.filter.as_ref() {
-            block.title_bottom(Line::raw(format!(" {filter} ")).right_aligned().reversed())
+            block.title_bottom(Line::raw(format!(" / {filter} · Esc clear ")).style(section.border))
         } else {
             block
         };
 
-        let iter = self
-            .items
-            .iter()
-            // filter content now
-            .filter_map(|value| {
-                self.filter
-                    .as_deref()
-                    .is_none_or(|pat| value.contains(pat))
-                    .then_some(value.as_str())
-            });
+        if visible_count == 0 {
+            let message = if self.filter.is_some() {
+                "No matching templates.\nEsc clears the filter."
+            } else {
+                "No templates found.\nAdd templates to the core's templates directory.\nPress ? for available shortcuts."
+            };
+            f.render_widget(
+                ratatui::widgets::Paragraph::new(message)
+                    .style(section.muted)
+                    .block(block)
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                area,
+            );
+            return;
+        }
+        let iter = visible_items(&self.items, self.filter.as_deref()).map(String::as_str);
         let widget = List::from_iter(iter)
             .block(block)
+            .highlight_symbol(if is_focused { "> " } else { "  " })
             .highlight_style(if is_focused {
                 section.highlight
             } else {
@@ -326,6 +352,7 @@ mod actions {
                 Self::Generate => generate(name).await,
                 Self::Delete => delete(name).await,
                 Self::Edit => _edit(name).await,
+                Self::ClearFilter => do_nothing(),
                 Self::EditProviders => _edit_providers(name).await,
                 Self::Preview => preview(name).await,
                 Self::Search => search().await,
@@ -380,21 +407,18 @@ mod actions {
         do_nothing()
     }
 
-    async fn _edit_providers(_name: String) -> CB {
-        let subdir = match crate::config::CONFIG.core_type() {
-            crate::config::CoreType::Mihomo => "mihomo",
-            crate::config::CoreType::Singbox => "sing-box",
-        };
-        let path = crate::config::config_dir_path()
-            .join(subdir)
-            .join("template_proxy_providers.yaml");
-        log::debug!("template::_edit_providers: path={}", path.display());
-        tri!(edit(path.to_str().unwrap()));
-        do_nothing()
+    async fn _edit_providers(name: String) -> CB {
+        // Provider groups now live in the template's clashtui metadata.
+        _edit(name).await
     }
 
-    async fn preview(_name: String) -> CB {
-        todo!()
+    async fn preview(name: String) -> CB {
+        let path = crate::functions::file::TEMPLATE_PATH.join(&name);
+        let content = tri!(std::fs::read_to_string(path));
+        Confirm::title(format!("Preview: {name}"))
+            .with_prompt(content)
+            .build_and_send();
+        do_nothing()
     }
 
     async fn search() -> CB {
@@ -408,18 +432,23 @@ mod actions {
 
         wrapper(|(_, content): &mut C| {
             content.filter = (!filter.is_empty()).then_some(filter);
+            content.jump_target.set(Some(0));
         })
     }
 
     pub(super) async fn fzf_find(items: Vec<String>) -> CB {
+        let fzf_items = items.clone();
         let selected = tokio::task::spawn_blocking(move || {
-            crate::tui::widget::fzffind::run_fzf(&items, "Find Template")
+            crate::tui::widget::fzffind::run_fzf(&fzf_items, "Find Template")
         })
         .await
-        .unwrap_or(None);
+        .unwrap_or(None)
+        .and_then(|idx| items.get(idx).cloned());
 
         wrapper(move |(_, content): &mut C| {
-            content.jump_target.set(selected);
+            let index =
+                selected.and_then(|name| content.items.iter().position(|item| item == &name));
+            content.jump_target.set(index);
         })
     }
 }

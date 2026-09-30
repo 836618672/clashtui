@@ -15,15 +15,11 @@ pub mod db {
         Ok(pm.get(name).unwrap())
     }
     pub fn remove(pf: Profile) -> anyhow::Result<()> {
-        for path in [
-            PROFILE_JSONS_PATH.join(format!("{}.json", pf.name)),
-            PROFILE_YAMLS_PATH.join(format!("{}.yaml", pf.name)),
-        ] {
-            if let Err(e) = std::fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                log::warn!("Failed to Remove profile file {}: {e}", path.display());
-            }
+        let path = local_profile_path(&pf.name);
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(e.into());
         }
         let mut pm = pm!();
         pm.remove(pf.name);
@@ -68,7 +64,126 @@ pub mod db {
     }
 }
 
+pub fn local_profile_path(name: &str) -> std::path::PathBuf {
+    match crate::config::CONFIG.core_type() {
+        crate::config::CoreType::Mihomo => PROFILE_YAMLS_PATH.join(format!("{name}.yaml")),
+        crate::config::CoreType::Singbox => PROFILE_JSONS_PATH.join(format!("{name}.json")),
+    }
+}
+
+pub fn validate_profile_name(name: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !name.is_empty()
+            && name.trim() == name
+            && name != "."
+            && name != ".."
+            && !name.ends_with('.')
+            && !name
+                .chars()
+                .any(|c| c.is_control() || "/\\<>:\"|?*".contains(c)),
+        "Enter a non-empty profile name without path separators or reserved filename characters"
+    );
+    Ok(())
+}
+
+pub fn validate_subscription_url(url: &str) -> anyhow::Result<()> {
+    let authority = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .and_then(|rest| rest.split(['/', '?', '#']).next());
+    anyhow::ensure!(
+        authority.is_some_and(|host| !host.is_empty()) && !url.chars().any(char::is_whitespace),
+        "Enter an HTTP or HTTPS subscription URL with a host"
+    );
+    Ok(())
+}
+
+/// Save metadata without downloading or applying a configuration. Renaming keeps
+/// the cached profile and current selection; failure leaves the old entry intact.
+pub fn edit_profile(old_name: &str, new_name: &str, url: Option<&str>) -> anyhow::Result<()> {
+    let path = local_profile_path(old_name);
+    edit_profile_in(
+        &mut pm!(),
+        path.parent().unwrap(),
+        &crate::config::config_dir_path().join("clashtui.db"),
+        old_name,
+        new_name,
+        url,
+    )
+}
+
+fn edit_profile_in(
+    pm: &mut crate::config::database::ProfileManager,
+    profile_dir: &std::path::Path,
+    db_path: &std::path::Path,
+    old_name: &str,
+    new_name: &str,
+    url: Option<&str>,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    validate_profile_name(old_name)?;
+    validate_profile_name(new_name)?;
+    let mut next = pm.clone();
+    let active = next.active_mut();
+    anyhow::ensure!(
+        old_name == new_name || !active.profiles.contains_key(new_name),
+        "Profile '{new_name}' already exists"
+    );
+    let mut data = active
+        .profiles
+        .remove(old_name)
+        .context("Profile no longer exists")?;
+    if let Some(url) = url {
+        validate_subscription_url(url)?;
+        anyhow::ensure!(
+            matches!(data.dtype, ProfileType::Url(_)),
+            "This profile has no subscription URL"
+        );
+        data.dtype = ProfileType::Url(url.to_owned());
+    }
+    active.profiles.insert(new_name.to_owned(), data);
+    if active.cur_profile.as_deref() == Some(old_name) {
+        active.cur_profile = Some(new_name.to_owned());
+    }
+    let extension = match pm.core_type {
+        crate::config::CoreType::Mihomo => "yaml",
+        crate::config::CoreType::Singbox => "json",
+    };
+    let old_path = profile_dir.join(format!("{old_name}.{extension}"));
+    let new_path = profile_dir.join(format!("{new_name}.{extension}"));
+    if old_name != new_name {
+        anyhow::ensure!(
+            !new_path.exists(),
+            "Profile file '{}' already exists",
+            new_path.display()
+        );
+    }
+    let tmp = db_path.with_extension("db.edit.tmp");
+    std::fs::write(&tmp, serde_yml::to_string(&next)?)?;
+    let moved = old_name != new_name && old_path.exists();
+    let commit = (|| -> anyhow::Result<()> {
+        if moved {
+            std::fs::rename(&old_path, &new_path).context("Failed to rename profile file")?;
+        }
+        if let Err(err) = std::fs::rename(&tmp, db_path) {
+            if moved {
+                std::fs::rename(&new_path, &old_path)
+                    .context("Failed to restore profile file after database save failed")?;
+            }
+            return Err(err).context("Failed to save profile changes");
+        }
+        Ok(())
+    })();
+    if commit.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    commit?;
+    *pm = next;
+    Ok(())
+}
+
 pub fn import_profile_from_file(source_path: &str, profile_name: &str) -> anyhow::Result<Profile> {
+    validate_profile_name(profile_name)?;
     let source = std::path::Path::new(source_path);
     anyhow::ensure!(source.exists(), "Source file not found: {source_path}");
     anyhow::ensure!(source.is_file(), "Source path is not a file: {source_path}");
@@ -79,6 +194,10 @@ pub fn import_profile_from_file(source_path: &str, profile_name: &str) -> anyhow
         .unwrap_or(false);
 
     if is_json {
+        anyhow::ensure!(
+            crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox,
+            "Switch to sing-box before importing a JSON profile"
+        );
         return import_singbox_profile(source, profile_name);
     }
 
@@ -587,6 +706,131 @@ pub fn extract_domain(url: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EditFixture(std::path::PathBuf);
+
+    impl EditFixture {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("clashtui-edit-{:x}", fastrand::u128(..)));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for EditFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn editing_subscription_renames_cache_and_current_selection_in_both_cores() {
+        use crate::config::{CoreType, database::ProfileManager};
+        for (core, extension) in [(CoreType::Mihomo, "yaml"), (CoreType::Singbox, "json")] {
+            let fixture = EditFixture::new();
+            let mut pm = ProfileManager {
+                core_type: core,
+                ..Default::default()
+            };
+            pm.insert("old", ProfileType::Url("https://old.example/sub".into()));
+            pm.set_no_pp("old", true);
+            pm.set_update_with_proxy("old", true);
+            pm.active_mut().cur_profile = Some("old".into());
+            let db_path = fixture.0.join("clashtui.db");
+            std::fs::write(&db_path, serde_yml::to_string(&pm).unwrap()).unwrap();
+            std::fs::write(fixture.0.join(format!("old.{extension}")), "cached config").unwrap();
+            edit_profile_in(
+                &mut pm,
+                &fixture.0,
+                &db_path,
+                "old",
+                "新订阅",
+                Some("https://new.example/sub"),
+            )
+            .unwrap();
+            assert!(pm.get("old").is_none());
+            let edited = pm.get_current().unwrap();
+            assert_eq!(edited.name, "新订阅");
+            assert_eq!(
+                edited.dtype,
+                ProfileType::Url("https://new.example/sub".into())
+            );
+            assert!(edited.no_pp && edited.update_with_proxy);
+            assert_eq!(
+                std::fs::read_to_string(fixture.0.join(format!("新订阅.{extension}"))).unwrap(),
+                "cached config"
+            );
+            assert!(!fixture.0.join(format!("old.{extension}")).exists());
+            let saved: ProfileManager =
+                serde_yml::from_str(&std::fs::read_to_string(db_path).unwrap()).unwrap();
+            assert_eq!(saved, pm);
+        }
+    }
+
+    #[test]
+    fn edit_rejects_duplicates_and_invalid_input_without_changes() {
+        let fixture = EditFixture::new();
+        let mut pm = crate::config::database::ProfileManager::default();
+        pm.insert("old", ProfileType::Url("https://old.example".into()));
+        pm.insert("taken", ProfileType::File);
+        let before = pm.clone();
+        for (name, url) in [
+            ("taken", None),
+            ("../escape", None),
+            ("", None),
+            ("old", Some("https://")),
+            ("old", Some("file:///tmp/a")),
+        ] {
+            assert!(
+                edit_profile_in(&mut pm, &fixture.0, &fixture.0.join("db"), "old", name, url)
+                    .is_err()
+            );
+            assert_eq!(before, pm);
+        }
+        assert!(!fixture.0.join("db").exists());
+    }
+
+    #[test]
+    fn failed_database_save_rolls_back_profile_rename() {
+        let fixture = EditFixture::new();
+        let mut pm = crate::config::database::ProfileManager::default();
+        pm.insert("old", ProfileType::File);
+        let before = pm.clone();
+        std::fs::write(fixture.0.join("old.yaml"), "cached").unwrap();
+        let db_path = fixture.0.join("db");
+        std::fs::create_dir(&db_path).unwrap();
+        assert!(edit_profile_in(&mut pm, &fixture.0, &db_path, "old", "new", None).is_err());
+        assert_eq!(pm, before);
+        assert!(fixture.0.join("old.yaml").exists());
+        assert!(!fixture.0.join("new.yaml").exists());
+    }
+
+    #[test]
+    fn url_can_be_edited_before_download_without_changing_other_core() {
+        let fixture = EditFixture::new();
+        let mut pm = crate::config::database::ProfileManager::default();
+        pm.insert("same", ProfileType::Url("https://mihomo.example".into()));
+        pm.core_type = crate::config::CoreType::Singbox;
+        pm.insert("same", ProfileType::Url("https://singbox.example".into()));
+        edit_profile_in(
+            &mut pm,
+            &fixture.0,
+            &fixture.0.join("db"),
+            "same",
+            "same",
+            Some("https://changed.example"),
+        )
+        .unwrap();
+        assert_eq!(
+            pm.get("same").unwrap().dtype,
+            ProfileType::Url("https://changed.example".into())
+        );
+        pm.core_type = crate::config::CoreType::Mihomo;
+        assert_eq!(
+            pm.get("same").unwrap().dtype,
+            ProfileType::Url("https://mihomo.example".into())
+        );
+    }
 
     fn merge(base_json: &str, overlay_json: &str) -> serde_json::Value {
         let mut base: serde_json::Value = serde_json::from_str(base_json).unwrap();

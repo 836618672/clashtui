@@ -20,7 +20,15 @@ impl Msg for Input {
             KeyCode::Enter => return Route::Send,
             KeyCode::Esc => return Route::Drop,
 
-            KeyCode::Char(ch) => self.enter_char(ch),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.buffer.chars().count(),
+            KeyCode::Char('a') if kv.ctrl => self.cursor = 0,
+            KeyCode::Char('e') if kv.ctrl => self.cursor = self.buffer.chars().count(),
+            KeyCode::Char('u') if kv.ctrl => {
+                self.buffer.clear();
+                self.cursor = 0;
+            }
+            KeyCode::Char(ch) if !kv.ctrl && !kv.alt && !kv.super_ => self.enter_char(ch),
             KeyCode::Backspace => self.delete_char(),
             KeyCode::Delete => self.delete_char_inplace(),
             KeyCode::Left => self.move_cursor_left(),
@@ -31,7 +39,7 @@ impl Msg for Input {
     }
 
     fn send(self, tx: Sender<Self::Result>) {
-        tx.send(self.buffer).unwrap()
+        let _ = tx.send(self.buffer);
     }
 
     fn render(&self, f: &mut Frame, area: Rect, block: Block, is_focused: bool) {
@@ -67,6 +75,11 @@ impl Input {
     pub fn new() -> Self {
         Default::default()
     }
+    pub fn with_value(mut self, value: impl Into<String>) -> Self {
+        self.buffer = value.into();
+        self.cursor = self.buffer.chars().count();
+        self
+    }
     pub fn with_title(self, title: String) -> MsgBuilder<Self> {
         MsgBuilder::new(self, title)
     }
@@ -99,7 +112,6 @@ impl Input {
             .enumerate()
             .filter_map(|(pos, (_, ch))| (pos != self.cursor).then_some(ch))
             .collect();
-        self.cursor = self.cursor.saturating_sub(1);
     }
     fn enter_char(&mut self, ch: char) {
         let pos = self.byte_offset();
@@ -120,6 +132,21 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefilled_unicode_input_keeps_cursor_on_character_boundaries() {
+        let mut input = Input::new().with_value("订阅abc");
+        assert_eq!(input.cursor, 5);
+        input.cursor = 1;
+        input.delete_char_inplace();
+        assert_eq!(input.buffer, "订abc");
+        assert_eq!(input.cursor, 1);
+        input.enter_char('新');
+        assert_eq!(input.buffer, "订新abc");
+        input.match_key_event(&"<C-u>".parse().unwrap());
+        assert_eq!(input.buffer, "");
+        assert_eq!(input.cursor, 0);
+    }
 
     #[test]
     fn input_cjk_insert_between_chars() {

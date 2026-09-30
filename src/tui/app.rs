@@ -209,11 +209,9 @@ impl App {
         }
 
         {
-            let shortcuts_ptr: *const [(KeyCombo, &str)] =
-                GLOBAL_CHORD_SHORTCUTS.as_slice() as *const _;
             if self
                 .global_chord
-                .handle(kv, unsafe { &*shortcuts_ptr }, &mut |seq| {
+                .handle(kv, &GLOBAL_CHORD_SHORTCUTS, &mut |seq| {
                     log::debug!("global_chord dispatch: {seq:?}");
                     match seq.last().and_then(|k| k.plain()) {
                         Some('c') => {
@@ -260,16 +258,12 @@ impl App {
         }
 
         let ti = self.tab_index as usize;
-        let shortcuts_ptr: *const [(widget::tab::KeyCombo, &str)] =
-            { self.tabs[ti].shortcuts() as *const _ };
+        let shortcuts = self.tabs[ti].shortcuts().to_vec();
 
-        if self
-            .chord
-            .handle(kv, unsafe { &*shortcuts_ptr }, &mut |seq| {
-                log::debug!("chord dispatch: {seq:?}");
-                self.tabs[ti].dispatch_shortcut(seq);
-            })
-        {
+        if self.chord.handle(kv, &shortcuts, &mut |seq| {
+            log::debug!("chord dispatch: {seq:?}");
+            self.tabs[ti].dispatch_shortcut(seq);
+        }) {
             return;
         }
 
@@ -280,7 +274,11 @@ impl App {
         use ratatui::prelude::{Constraint, Layout};
 
         let chunks = Layout::default()
-            .constraints([Constraint::Length(3), Constraint::Fill(1)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Fill(1),
+                Constraint::Length(2),
+            ])
             .split(f.area());
 
         render_tabbar(
@@ -291,6 +289,7 @@ impl App {
         );
 
         self.tabs[self.tab_index as usize].render(f, chunks[1]);
+        render_footer(self.tabs[self.tab_index as usize].shortcuts(), f, chunks[2]);
 
         if self.chord.is_active() {
             self.render_which(f);
@@ -502,23 +501,116 @@ fn render_tabbar(
     area: ratatui::layout::Rect,
 ) {
     use crate::tui::theme::Theme;
-    use ratatui::style::{Styled, Stylize};
     use ratatui::text::Line;
     use ratatui::widgets::{Block, Tabs};
 
     let theme = Theme::get();
     let block = Block::bordered()
-        .title(" Clashtui ")
-        .title_bottom(Line::raw(" Tab or num ").right_aligned().reversed());
-    let titles = titles
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(theme.section("file").border)
+        .title(format!(
+            " ClashTUI · {} ",
+            crate::config::CONFIG.core_type()
+        ));
+    let titles: Vec<_> = titles
         .into_iter()
         .enumerate()
-        .map(|(idx, s)| format!("{} {s}", idx + 1).set_style(theme.tabbar.text));
+        .map(|(idx, title)| {
+            let title = match title {
+                "CoreSrvCtl" => "Service",
+                "Connections" => "Conns",
+                "File" => "Files",
+                other => other,
+            };
+            let label = if area.width < 76 && idx != selected as usize {
+                format!("{}", idx + 1)
+            } else {
+                format!("{} {title}", idx + 1)
+            };
+            Line::from(label)
+        })
+        .collect();
     let widget = Tabs::new(titles)
         .block(block)
-        .highlight_style(theme.tabbar.highlight)
+        .style(theme.tabbar.text)
+        .divider(" ")
+        .highlight_style(theme.tabbar.highlight.bold())
         .select(Some(selected as usize));
     f.render_widget(widget, area);
+}
+
+fn render_footer(
+    shortcuts: &[(KeyCombo, &'static str)],
+    f: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+) {
+    use ratatui::{
+        text::{Line, Span},
+        widgets::Paragraph,
+    };
+    use unicode_width::UnicodeWidthStr;
+    let theme = Theme::get();
+    let section = theme.section("file");
+    let priorities = [
+        "Edit subscription",
+        "Import (URL or file)",
+        "Switch pane",
+        "Generate",
+        "Edit",
+        "Select",
+        "Update",
+        "Edit config file",
+        "Search/Filter",
+        "Execute",
+        "Apply",
+        "Test delay",
+        "Pause/Resume",
+    ];
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for description in priorities {
+        if let Some((combo, _)) = shortcuts
+            .iter()
+            .filter(|(_, desc)| *desc == description)
+            .min_by_key(|(combo, _)| {
+                let keys = combo
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (keys.len(), keys)
+            })
+        {
+            let keys = combo
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let label = match description {
+                "Edit subscription" => "Edit subscription",
+                "Import (URL or file)" => "Import",
+                "Search/Filter" => "Filter",
+                "Switch pane" => "Switch pane",
+                other => other,
+            };
+            let width = keys.width() + label.width() + 4;
+            if used + width > area.width as usize {
+                continue;
+            }
+            spans.push(Span::styled(format!(" {keys} "), section.border));
+            spans.push(Span::styled(format!("{label}  "), section.text));
+            used += width;
+        }
+    }
+    let help = if area.width < 60 {
+        " ? Help  Tab Next  q Quit"
+    } else {
+        " ? All shortcuts   Tab / 1–7 Switch tab   q Quit"
+    };
+    f.render_widget(
+        Paragraph::new(vec![Line::from(spans), Line::styled(help, section.muted)]),
+        area,
+    );
 }
 
 /// Ha! Magic Code!

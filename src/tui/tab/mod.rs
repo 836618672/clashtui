@@ -4,7 +4,7 @@ mod dev {
     pub use crate::tui::widget::tab::*;
     pub use crossterm::event::KeyCode;
     pub use ratatui::prelude::{Frame, Rect};
-    pub use ratatui::style::{Color, Stylize as _};
+    pub use ratatui::style::Stylize as _;
     pub use ratatui::widgets::{Block, List, ListState, StatefulWidget};
 
     pub use crate::tui::popmsg::prelude::*;
@@ -81,8 +81,14 @@ pub(crate) mod agent {
         AGENT.get_or_init(default_agent)
     }
 
+    pub(super) fn merged_agent(map: Agent) -> Agent {
+        let mut merged = default_agent();
+        merged.extend(map);
+        merged
+    }
+
     pub fn init(map: Agent) {
-        if AGENT.set(map).is_err() {
+        if AGENT.set(merged_agent(map)).is_err() {
             unreachable!("KeyMap Init Twice!")
         }
     }
@@ -156,7 +162,12 @@ pub(crate) mod agent {
                     // Remove default chords whose key sequence conflicts with user chords
                     let user_combos: std::collections::HashSet<KeyCombo> =
                         user_chords.iter().map(|(c, _, _)| c.clone()).collect();
-                    v.retain(|(combo, _, _)| combo.len() == 1 || !user_combos.contains(combo));
+                    // Explicit chords also override default single-key prefixes.
+                    // Otherwise merging defaults would make e.g. [e, u] unreachable.
+                    v.retain(|(combo, _, _)| {
+                        !user_combos.contains(combo) && !(combo.len() == 1 &&
+                            user_chords.iter().any(|(user, _, _)| user.first() == combo.first()))
+                    });
                 }
                 for (combo, key, desc) in user_chords {
                     v.push((combo.clone(), *key, Box::leak(desc.clone().into_boxed_str())));

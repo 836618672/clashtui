@@ -204,7 +204,7 @@ pub struct CoreProfileData {
 }
 
 #[cfg_attr(test, derive(PartialEq))]
-#[derive(serde::Serialize, serde::Deserialize, Debug, Default)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
 /// manage profiles with mihomo/singbox sections
 pub struct ProfileManager {
     #[serde(default)]
@@ -215,8 +215,18 @@ pub struct ProfileManager {
     pub singbox: CoreProfileData,
 }
 impl ProfileManager {
-    pub fn contains_in_singbox(&self, name: &str) -> bool {
-        self.singbox.profiles.contains_key(name)
+    pub fn active(&self) -> &CoreProfileData {
+        match self.core_type {
+            crate::config::CoreType::Mihomo => &self.mihomo,
+            crate::config::CoreType::Singbox => &self.singbox,
+        }
+    }
+
+    pub fn active_mut(&mut self) -> &mut CoreProfileData {
+        match self.core_type {
+            crate::config::CoreType::Mihomo => &mut self.mihomo,
+            crate::config::CoreType::Singbox => &mut self.singbox,
+        }
     }
 
     pub fn insert<S: AsRef<str>>(&mut self, name: S, dtype: ProfileType) -> Option<Profile> {
@@ -241,11 +251,10 @@ impl ProfileManager {
     }
     pub fn get<S: AsRef<str>>(&self, name: S) -> Option<Profile> {
         let name = name.as_ref();
-        self.mihomo
+        self.active()
             .profiles
             .get(name)
             .cloned()
-            .or_else(|| self.singbox.profiles.get(name).cloned())
             .map(|data| Profile {
                 name: name.to_string(),
                 dtype: data.dtype,
@@ -262,16 +271,11 @@ impl ProfileManager {
     }
     pub fn remove<S: AsRef<str>>(&mut self, name: S) -> Option<Profile> {
         let name = name.as_ref();
-        let from_mihomo = self.mihomo.profiles.remove(name).map(|data| Profile {
-            name: name.to_string(),
-            dtype: data.dtype,
-            no_pp: data.no_pp,
-            update_with_proxy: data.update_with_proxy,
-        });
-        if from_mihomo.is_some() {
-            return from_mihomo;
+        let active = self.active_mut();
+        if active.cur_profile.as_deref() == Some(name) {
+            active.cur_profile = None;
         }
-        self.singbox.profiles.remove(name).map(|data| Profile {
+        active.profiles.remove(name).map(|data| Profile {
             name: name.to_string(),
             dtype: data.dtype,
             no_pp: data.no_pp,
@@ -303,17 +307,13 @@ impl ProfileManager {
     }
     pub fn set_no_pp<S: AsRef<str>>(&mut self, name: S, no_pp: bool) {
         let name = name.as_ref();
-        if let Some(data) = self.mihomo.profiles.get_mut(name) {
-            data.no_pp = no_pp;
-        } else if let Some(data) = self.singbox.profiles.get_mut(name) {
+        if let Some(data) = self.active_mut().profiles.get_mut(name) {
             data.no_pp = no_pp;
         }
     }
     pub fn set_update_with_proxy<S: AsRef<str>>(&mut self, name: S, val: bool) {
         let name = name.as_ref();
-        if let Some(data) = self.mihomo.profiles.get_mut(name) {
-            data.update_with_proxy = val;
-        } else if let Some(data) = self.singbox.profiles.get_mut(name) {
+        if let Some(data) = self.active_mut().profiles.get_mut(name) {
             data.update_with_proxy = val;
         }
     }
@@ -322,6 +322,23 @@ impl ProfileManager {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn same_named_profiles_are_isolated_by_active_core() {
+        let mut pm = ProfileManager::default();
+        pm.insert("shared", ProfileType::Url("https://mihomo.example".into()));
+        pm.core_type = crate::config::CoreType::Singbox;
+        pm.insert("shared", ProfileType::Url("https://singbox.example".into()));
+        pm.set_update_with_proxy("shared", true);
+        assert_eq!(
+            pm.get("shared").unwrap().dtype,
+            ProfileType::Url("https://singbox.example".into())
+        );
+        pm.remove("shared");
+        assert!(pm.get("shared").is_none());
+        pm.core_type = crate::config::CoreType::Mihomo;
+        assert!(!pm.get("shared").unwrap().update_with_proxy);
+    }
     #[test]
     fn serde_template_deserialized_as_template() {
         let yaml = r#"core_type: mihomo

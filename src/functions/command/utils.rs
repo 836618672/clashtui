@@ -80,26 +80,24 @@ pub fn shell_spawn(cmd_template: &str, path: &str) -> Result<()> {
         } else {
             spawn("sh", vec!["-c", &format!("xdg-open \"{}\"", path)])
         }
-    } else {
-        if cfg!(windows) {
-            let path = sanitize_windows_path(path);
-            let cmd = cmd_template.replace("%s", &path);
-            log::debug!("SPW: cmd {} {}", "cmd", cmd);
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                Command::new("cmd")
-                    .stderr(Stdio::null())
-                    .stdout(Stdio::null())
-                    .raw_arg("/c")
-                    .raw_arg(&cmd)
-                    .spawn()?;
-            }
-            Ok(())
-        } else {
-            let cmd = cmd_template.replace("%s", path);
-            spawn("sh", vec!["-c", &cmd])
+    } else if cfg!(windows) {
+        let path = sanitize_windows_path(path);
+        let cmd = cmd_template.replace("%s", &path);
+        log::debug!("SPW: cmd {} {}", "cmd", cmd);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            Command::new("cmd")
+                .stderr(Stdio::null())
+                .stdout(Stdio::null())
+                .raw_arg("/c")
+                .raw_arg(&cmd)
+                .spawn()?;
         }
+        Ok(())
+    } else {
+        let cmd = cmd_template.replace("%s", path);
+        spawn("sh", vec!["-c", &cmd])
     }
 }
 

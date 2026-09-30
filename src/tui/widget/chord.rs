@@ -20,11 +20,10 @@ impl ChordHandler {
         shortcuts: &[(KeyCombo, &'static str)],
         dispatch: &mut dyn FnMut(&[Key]),
     ) -> bool {
-        if self.is_active() {
-            self.continue_(kv, dispatch)
-        } else {
-            self.check_init(kv, shortcuts, dispatch)
+        if self.is_active() && self.continue_(kv, dispatch) {
+            return true;
         }
+        self.check_init(kv, shortcuts, dispatch)
     }
 
     fn reset(&mut self) {
@@ -46,12 +45,14 @@ impl ChordHandler {
         match self.candidates.len() {
             0 => {
                 self.reset();
-                true
+                false
             }
             1 => {
-                let seq = self.candidates[0].0.clone();
-                self.reset();
-                dispatch(&seq);
+                if self.candidates[0].0.len() == self.pressed.len() {
+                    let seq = self.candidates[0].0.clone();
+                    self.reset();
+                    dispatch(&seq);
+                }
                 true
             }
             _ => {
@@ -108,6 +109,43 @@ pub fn key_event_to_str(k: &Key) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_still_dispatches_after_an_unfinished_chord() {
+        let shortcuts = make_shortcuts(&[
+            (&[KeyCode::Char('g'), KeyCode::Char('g')], "Top"),
+            (&[KeyCode::Char('e')], "Edit"),
+        ]);
+        let mut handler = ChordHandler::default();
+        let mut dispatched = Vec::new();
+        handler.handle(&mk_key(KeyCode::Char('g')), &shortcuts, &mut |_| {});
+        assert!(
+            handler.handle(&mk_key(KeyCode::Char('e')), &shortcuts, &mut |seq| {
+                dispatched.push(seq.to_vec())
+            })
+        );
+        assert_eq!(dispatched, vec![vec![mk_key(KeyCode::Char('e'))]]);
+    }
+
+    #[test]
+    fn three_key_chord_waits_for_the_final_key() {
+        let shortcuts = make_shortcuts(&[(
+            &[KeyCode::Char('g'), KeyCode::Char('e'), KeyCode::Char('x')],
+            "Action",
+        )]);
+        let mut handler = ChordHandler::default();
+        let mut dispatched = Vec::new();
+        for c in ['g', 'e'] {
+            handler.handle(&mk_key(KeyCode::Char(c)), &shortcuts, &mut |seq| {
+                dispatched.push(seq.to_vec())
+            });
+            assert!(dispatched.is_empty());
+        }
+        handler.handle(&mk_key(KeyCode::Char('x')), &shortcuts, &mut |seq| {
+            dispatched.push(seq.to_vec())
+        });
+        assert_eq!(dispatched.len(), 1);
+    }
 
     fn mk_key(code: KeyCode) -> Key {
         Key {
@@ -183,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn chord_continue_non_matching_cancels_and_consumes() {
+    fn chord_continue_non_matching_cancels_and_passes_key_through() {
         let g = mk_key(KeyCode::Char('g'));
         let x = mk_key(KeyCode::Char('x'));
         let shortcuts = make_shortcuts(&[(&[KeyCode::Char('g'), KeyCode::Char('g')], "GoTop")]);
@@ -193,7 +231,7 @@ mod tests {
         handler.handle(&g, &shortcuts, &mut |seq| dispatched.push(seq.to_vec()));
         let consumed = handler.handle(&x, &shortcuts, &mut |seq| dispatched.push(seq.to_vec()));
 
-        assert!(consumed);
+        assert!(!consumed);
         assert!(dispatched.is_empty());
         assert!(!handler.is_active());
     }
@@ -262,7 +300,7 @@ mod tests {
         handler.handle(&g, &shortcuts, &mut |seq| dispatched.push(seq.to_vec()));
         let consumed = handler.handle(&cc, &shortcuts, &mut |seq| dispatched.push(seq.to_vec()));
 
-        assert!(consumed);
+        assert!(!consumed);
         assert!(dispatched.is_empty());
         assert!(
             !handler.is_active(),

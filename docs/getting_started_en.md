@@ -102,6 +102,12 @@ proxies:
     desc: Expand/Collapse
 ```
 
+### Editing subscriptions
+
+In Files (`2`), focus the Profiles pane and press `e` to edit the selected profile's name and subscription URL. Fields are prefilled; use `Home` / `End` to move, `Ctrl-U` to clear, and `Enter` to continue or save. `Esc` at either step cancels all changes. File and template profiles only offer renaming.
+
+Saving preserves the cached configuration, update options, and current selection. After changing the URL, press `u` to download from the new address. `E` opens the configuration file using `extra.edit_cmd` or the system default application. `/` filters the list and `Esc` clears the filter. The footer shows shortcuts for the focused pane. Narrow terminals show only that pane; use the left/right arrows to switch panes.
+
 ## CLI Mode
 
 You can operate without entering the TUI, suitable for scripting or automation.
@@ -329,7 +335,7 @@ Make sure the Mihomo or sing-box core has been started. Go to the CoreSrvCtl tab
 This means the running core doesn't match Clashtui's configured core. Go to the CoreSrvCtl tab to confirm which core you actually want to use, switch to it, then restart Clashtui.
 
 **How do I add a subscription?**
-Go to the Files tab (press `2`), press `?` to see shortcuts. Typically press `a` to add a new Profile, then enter the subscription URL. Clashtui will automatically download and update.
+Go to Files (`2`), focus Profiles and press `i` to import a profile by name and subscription URL. The imported profile is selected automatically. Press `e` to edit its name or URL, or `?` for the current shortcuts.
 
 **How do I create a sing-box template subscription?**
 1. Place a JSON template file in `sing-box/templates/`

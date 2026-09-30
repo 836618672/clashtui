@@ -97,7 +97,21 @@ mod_agent!(
             Key::Action(Action::Delete),
             "Delete profile"
         ),
-        ([KeyCode::Char('e')], Key::Action(Action::Edit), "Edit"),
+        (
+            [KeyCode::Char('e')],
+            Key::Action(Action::Edit),
+            "Edit subscription"
+        ),
+        (
+            [KeyCode::Char('E')],
+            Key::Action(Action::EditFile),
+            "Edit config file"
+        ),
+        (
+            [KeyCode::Esc],
+            Key::Action(Action::ClearFilter),
+            "Clear filter"
+        ),
         (
             [KeyCode::Char('p')],
             Key::Action(Action::Preview),
@@ -217,6 +231,8 @@ impl<'de> serde::Deserialize<'de> for Key {
                         "ImportFile" => Ok(Key::Action(Action::ImportFile)),
                         "Delete" => Ok(Key::Action(Action::Delete)),
                         "Edit" => Ok(Key::Action(Action::Edit)),
+                        "EditFile" => Ok(Key::Action(Action::EditFile)),
+                        "ClearFilter" => Ok(Key::Action(Action::ClearFilter)),
                         "Preview" => Ok(Key::Action(Action::Preview)),
                         "Update" => Ok(Key::Action(Action::Update)),
                         "UpdateAll" => Ok(Key::Action(Action::UpdateAll)),
@@ -229,7 +245,9 @@ impl<'de> serde::Deserialize<'de> for Key {
                         "GoEnd" => Ok(Key::Action(Action::GoEnd)),
                         "ToggleNoPp" => Ok(Key::Action(Action::ToggleNoPp)),
                         "ToggleUpdateWithProxy" => Ok(Key::Action(Action::ToggleUpdateWithProxy)),
-                        "Traffic" => Ok(Key::Action(Action::Traffic)),
+                        "Traffic" | "TrafficNext" | "TrafficPrev" => {
+                            Ok(Key::Action(Action::Traffic))
+                        }
                         s => Err(de::Error::unknown_variant(
                             s,
                             &[
@@ -269,6 +287,8 @@ pub enum Action {
     ImportFile,
     Delete,
     Edit,
+    EditFile,
+    ClearFilter,
     Preview,
     Update,
     UpdateAll,
@@ -313,6 +333,7 @@ pub struct Profile {
     filter: Option<String>,
     updating: HashSet<String>,
     jump_target: Cell<Option<usize>>,
+    status: Option<String>,
 }
 
 impl BasicTabContent for Profile {
@@ -362,10 +383,18 @@ impl DualTabContent for Profile {
                     actions::show_traffic(name).spawn_at(task_set);
                 }
                 Action::FzfFind => {
-                    let items = self.items.clone();
+                    let items = visible_items(&self.items, self.filter.as_deref())
+                        .cloned()
+                        .collect();
                     actions::fzf_find(items).spawn_at(task_set)
                 }
-                Action::Add | Action::ImportFile => action.act(String::new()).spawn_at(task_set),
+                Action::Add | Action::ImportFile | Action::Search => {
+                    action.act(String::new()).spawn_at(task_set)
+                }
+                Action::ClearFilter => {
+                    self.filter = None;
+                    state.select_first();
+                }
                 Action::UpdateAll => {
                     for name in &self.items {
                         self.updating.insert(name.clone());
@@ -374,6 +403,12 @@ impl DualTabContent for Profile {
                 }
                 _ => {
                     let name = get_name!(self, state);
+                    if self.updating.contains(&name) {
+                        self.status = Some(
+                            "This profile is updating; wait before editing or deleting it.".into(),
+                        );
+                        return false;
+                    }
                     if matches!(action, Action::Update) {
                         self.updating.insert(name.clone());
                     }
@@ -389,20 +424,12 @@ impl DualTabContent for Profile {
             state.select(Some(idx));
         }
 
-        // Clamp cursor to valid range
-        if let Some(idx) = state.selected() {
-            if self.items.is_empty() {
-                state.select(None);
-            } else if idx >= self.items.len() {
-                state.select(Some(self.items.len().saturating_sub(1)));
-            }
-        } else if !self.items.is_empty() {
-            state.select(Some(0));
-        }
+        let visible_count = visible_items(&self.items, self.filter.as_deref()).count();
+        clamp_selection(state, visible_count);
 
         let theme = Theme::get();
         let section = theme.section("file");
-        let unfocused_border = section.border.fg(Color::Rgb(100, 100, 100));
+        let unfocused_border = section.muted;
         let unfocused_highlight = Style::new();
 
         let block = Block::bordered()
@@ -411,13 +438,57 @@ impl DualTabContent for Profile {
             } else {
                 unfocused_border
             })
-            .title(Self::TITLE);
+            .title(format!(
+                " {}Profiles ({visible_count}) ",
+                if is_focused { "> " } else { "" }
+            ))
+            .title_bottom(
+                Line::raw(format!(
+                    " {}/{} ",
+                    state.selected().map_or(0, |i| i + 1),
+                    visible_count
+                ))
+                .right_aligned(),
+            );
 
         let block = if let Some(filter) = self.filter.as_ref() {
-            block.title_bottom(Line::raw(format!(" {filter} ")).right_aligned().reversed())
+            block.title_bottom(Line::raw(format!(" / {filter} · Esc clear ")).style(section.border))
         } else {
             block
         };
+
+        let areas = ratatui::layout::Layout::vertical([
+            ratatui::layout::Constraint::Fill(1),
+            ratatui::layout::Constraint::Length(if is_focused && self.status.is_some() {
+                2
+            } else {
+                0
+            }),
+        ])
+        .split(area);
+        if is_focused && let Some(status) = &self.status {
+            f.render_widget(
+                ratatui::widgets::Paragraph::new(status.as_str())
+                    .style(section.muted)
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                areas[1],
+            );
+        }
+        if visible_count == 0 {
+            let message = if self.filter.is_some() {
+                "No matching profiles.\nEsc clears the filter."
+            } else {
+                "No subscriptions yet.\nImport a URL or local file to get started.\nPress ? for available shortcuts."
+            };
+            f.render_widget(
+                ratatui::widgets::Paragraph::new(message)
+                    .style(section.muted)
+                    .block(block)
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
+                areas[0],
+            );
+            return;
+        }
 
         let current = &crate::config::CONFIG
             .data
@@ -446,19 +517,24 @@ impl DualTabContent for Profile {
                 }
 
                 spans.push(Span::raw(value.as_str()));
-                spans.push(Span::raw(" "));
-                spans.push(Span::raw(extra.as_str()).style(section.muted));
-
-                ListItem::new(Line::from(spans))
+                if is_focused {
+                    ListItem::new(vec![
+                        Line::from(spans),
+                        Line::from(format!("  {extra}")).style(section.muted),
+                    ])
+                } else {
+                    ListItem::new(Line::from(spans))
+                }
             });
         let widget = List::from_iter(iter)
             .block(block)
+            .highlight_symbol(if is_focused { "> " } else { "  " })
             .highlight_style(if is_focused {
                 section.highlight
             } else {
                 unfocused_highlight
             });
-        f.render_stateful_widget(widget, area, state);
+        f.render_stateful_widget(widget, areas[0], state);
     }
 }
 
@@ -471,6 +547,8 @@ mod actions {
                 Self::Search => search().await,
                 Self::Add | Self::ImportFile => import().await,
                 Self::Edit => _edit(name).await,
+                Self::EditFile => edit_file(name).await,
+                Self::ClearFilter => do_nothing(),
                 Self::Delete => delete(name).await,
                 Self::Preview => preview(name).await,
                 Self::Update => update(name).await,
@@ -503,18 +581,23 @@ mod actions {
 
         wrapper(|(content, _): &mut C| {
             content.filter = (!filter.is_empty()).then_some(filter);
+            content.jump_target.set(Some(0));
         })
     }
 
     pub(super) async fn fzf_find(items: Vec<String>) -> CB {
+        let fzf_items = items.clone();
         let selected = tokio::task::spawn_blocking(move || {
-            crate::tui::widget::fzffind::run_fzf(&items, "Find Profile")
+            crate::tui::widget::fzffind::run_fzf(&fzf_items, "Find Profile")
         })
         .await
-        .unwrap_or(None);
+        .unwrap_or(None)
+        .and_then(|idx| items.get(idx).cloned());
 
         wrapper(move |(content, _): &mut C| {
-            content.jump_target.set(selected);
+            let index =
+                selected.and_then(|name| content.items.iter().position(|item| item == &name));
+            content.jump_target.set(index);
         })
     }
 
@@ -526,6 +609,18 @@ mod actions {
                 .await,
             or_cancel
         );
+        let name = name.trim().to_owned();
+        tri!(crate::functions::file::profile::validate_profile_name(
+            &name
+        ));
+        if db::get(&name).is_some()
+            || crate::functions::file::profile::local_profile_path(&name).exists()
+        {
+            Confirm::err(format!(
+                "Profile '{name}' already exists. Use Edit subscription to change it."
+            ));
+            return do_nothing();
+        }
         let source = tri!(
             Input::new()
                 .with_title("URL or File Path".to_owned())
@@ -533,6 +628,7 @@ mod actions {
                 .await,
             or_cancel
         );
+        let source = source.trim().to_owned();
 
         let is_url = source.starts_with("http://") || source.starts_with("https://");
         let is_singbox = crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox;
@@ -579,19 +675,93 @@ mod actions {
                 let file = tri!(std::fs::File::create(&path));
                 tri!(serde_yml::to_writer(file, &content));
             }
-            tri!(db::create(name, source));
+            tri!(db::create(&name, source));
         } else {
             tri!(crate::functions::file::profile::import_profile_from_file(
                 &source, &name
             ));
         }
 
-        sync!(C)
+        let (names, atime) = get_profiles_with_readable_atime();
+        wrapper(move |(content, _): &mut C| {
+            sync_helper(content, names, atime);
+            content.filter = None;
+            content
+                .jump_target
+                .set(content.items.iter().position(|n| n == &name));
+            content.status = Some(format!(
+                "Imported {name}. Edit subscription to change its name or URL."
+            ));
+        })
     }
 
     async fn _edit(name: String) -> CB {
-        let pf = tri!(db::get(name).unwrap().load_local_profile());
-        tri!(edit(pf.path.to_str().unwrap()));
+        use crate::functions::file::profile::{
+            edit_profile, validate_profile_name, validate_subscription_url,
+        };
+        let pf = tri!(db::get(&name).ok_or_else(|| anyhow::anyhow!("Profile no longer exists")));
+        let new_name = tri!(
+            edit_field("Edit profile name", name.clone(), |value| {
+                validate_profile_name(value)?;
+                anyhow::ensure!(
+                    value == name || db::get(value).is_none(),
+                    "A profile with this name already exists"
+                );
+                Ok(())
+            })
+            .await,
+            or_cancel
+        );
+        let url = if let crate::config::database::ProfileType::Url(url) = pf.dtype {
+            Some(tri!(
+                edit_field("Edit subscription URL", url, validate_subscription_url).await,
+                or_cancel
+            ))
+        } else {
+            None
+        };
+        tri!(edit_profile(&name, &new_name, url.as_deref()));
+        let (names, atime) = get_profiles_with_readable_atime();
+        wrapper(move |(content, _): &mut C| {
+            sync_helper(content, names, atime);
+            content.filter = None;
+            content
+                .jump_target
+                .set(content.items.iter().position(|n| n == &new_name));
+            content.status = Some(if url.is_some() {
+                format!("Saved {new_name}. Update the subscription to download from the saved URL.")
+            } else {
+                format!("Saved {new_name}.")
+            });
+        })
+    }
+
+    async fn edit_field(
+        title: &str,
+        mut value: String,
+        validate: impl Fn(&str) -> anyhow::Result<()>,
+    ) -> anyhow::Result<String> {
+        let help = "Enter: continue / save   Esc: cancel all changes\nHome/End: move cursor   Ctrl-U: clear";
+        let mut prompt = help.to_owned();
+        loop {
+            value = Input::new()
+                .with_value(value)
+                .with_title(title.to_owned())
+                .with_prompt(prompt)
+                .build_and_send()
+                .await?
+                .trim()
+                .to_owned();
+            match validate(&value) {
+                Ok(()) => return Ok(value),
+                Err(e) => prompt = format!("{e}\n\n{help}"),
+            }
+        }
+    }
+
+    async fn edit_file(name: String) -> CB {
+        let path = crate::functions::file::profile::local_profile_path(&name);
+        tri!(edit(path.to_str().unwrap()));
 
         do_nothing()
     }
@@ -600,11 +770,7 @@ mod actions {
         {
             let pf = tri!(db::get(&name).ok_or_else(|| anyhow::anyhow!("Profile not found")));
             if pf.dtype == crate::config::database::ProfileType::Singbox
-                || crate::config::CONFIG
-                    .data
-                    .lock()
-                    .unwrap()
-                    .contains_in_singbox(&pf.name)
+                || crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox
             {
                 Confirm::err(anyhow::anyhow!(
                     "no_pp is not applicable for sing-box profiles (proxy-provider not supported)"
@@ -954,12 +1120,7 @@ pub(super) fn get_profiles_with_readable_atime() -> (Vec<String>, Vec<String>) {
             let name = pf.name.clone();
             let no_pp = pf.no_pp;
             let update_with_proxy = pf.update_with_proxy;
-            let is_singbox = pf.dtype == ProfileType::Singbox
-                || crate::config::CONFIG
-                    .data
-                    .lock()
-                    .unwrap()
-                    .contains_in_singbox(&pf.name);
+            let is_singbox = crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox;
             let domain = match &pf.dtype {
                 ProfileType::File => "local import".to_owned(),
                 ProfileType::Url(url) => extract_domain(url).unwrap_or("unknown").to_owned(),
@@ -972,15 +1133,14 @@ pub(super) fn get_profiles_with_readable_atime() -> (Vec<String>, Vec<String>) {
                 .and_then(|lp| lp.atime())
                 .map(display_duration)
                 .unwrap_or_else(|| "Unknown".to_owned());
-            let no_pp_str = if is_singbox {
-                "N/A"
-            } else if no_pp {
-                "nopp"
-            } else {
-                ""
-            };
+            let no_pp_str = if no_pp && !is_singbox { "nopp" } else { "" };
             let pxy_str = if update_with_proxy { "proxy" } else { "" };
-            (name, format!("{domain}|{atime}|{no_pp_str}|{pxy_str}"))
+            let extra = [domain.as_str(), atime.as_str(), no_pp_str, pxy_str]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ");
+            (name, extra)
         })
         .collect();
     composed.sort_unstable();
@@ -995,23 +1155,61 @@ pub(super) fn sync_helper(content: &mut Profile, name: Vec<String>, atime: Vec<S
 
 fn display_duration(t: std::time::Duration) -> String {
     use std::time::Duration;
-    if t.is_zero() {
-        "Just Now".to_string()
+    if t < Duration::from_secs(60) {
+        "Just now".to_string()
     } else if t < Duration::from_secs(60 * 59) {
         let min = t.as_secs() / 60;
-        format!("In {} mins", min + 1)
+        format!("{min}m ago")
     } else if t < Duration::from_secs(3600 * 24) {
         let hou = t.as_secs() / 3600;
-        format!("In {hou} hours")
+        format!("{hou}h ago")
     } else {
         let day = t.as_secs() / (3600 * 24);
-        format!("In about {day} days")
+        format!("{day}d ago")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_keymap_keeps_edit_and_import_bindings() {
+        let j = "j".parse().unwrap();
+        let keys = agent::merged_agent(HashMap::from([(j, Key::MoveUp)]));
+        assert!(matches!(keys.get(&j), Some(Key::MoveUp)));
+        assert!(matches!(
+            keys.get(&"e".parse().unwrap()),
+            Some(Key::Action(Action::Edit))
+        ));
+        assert!(matches!(
+            keys.get(&"E".parse().unwrap()),
+            Some(Key::Action(Action::EditFile))
+        ));
+        assert!(matches!(
+            keys.get(&"i".parse().unwrap()),
+            Some(Key::Action(Action::Add))
+        ));
+    }
+
+    #[test]
+    fn bundled_and_legacy_profile_keymaps_are_accepted() {
+        let config: serde_yml::Value = serde_yml::from_str(include_str!(
+            "../../../../contrib/default_configs/default_keymap.yaml"
+        ))
+        .unwrap();
+        let entries: Vec<crate::tui::agent::Entry> =
+            serde_yml::from_value(config["file"]["profile"].clone()).unwrap();
+        let (keys, _, _) = crate::tui::agent::extract_keymap_list::<Key>(entries).unwrap();
+        assert!(matches!(
+            keys.get(&"e".parse().unwrap()),
+            Some(Key::Action(Action::Edit))
+        ));
+        for legacy in ["TrafficNext", "TrafficPrev"] {
+            let key: Key = serde_yml::from_str(&format!("Action: {legacy}")).unwrap();
+            assert!(matches!(key, Key::Action(Action::Traffic)));
+        }
+    }
 
     #[test]
     fn parse_traffic_info_all_fields() {

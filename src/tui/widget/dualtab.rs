@@ -156,17 +156,15 @@ where
             {
                 self.is_focus_on_c1 = false
             }
-        } else {
-            if let Ok(key) = C2::Key::try_from(kv)
-                && DualTabContentMate::handle_key_event(
-                    &mut self.content.1,
-                    key,
-                    &mut self.tasks,
-                    &mut self.state.1,
-                )
-            {
-                self.is_focus_on_c1 = true
-            }
+        } else if let Ok(key) = C2::Key::try_from(kv)
+            && DualTabContentMate::handle_key_event(
+                &mut self.content.1,
+                key,
+                &mut self.tasks,
+                &mut self.state.1,
+            )
+        {
+            self.is_focus_on_c1 = true
         }
     }
 
@@ -178,6 +176,15 @@ where
         } else {
             [Ratio(3, 10), Ratio(7, 10)]
         };
+        // On narrow terminals, give the focused pane the full width.
+        if area.width < 90 {
+            if self.is_focus_on_c1 {
+                self.content.0.render(f, area, &mut self.state.0, true);
+            } else {
+                self.content.1.render(f, area, &mut self.state.1, true);
+            }
+            return;
+        }
         let hori = Layout::horizontal(cons).split(area);
 
         self.content
