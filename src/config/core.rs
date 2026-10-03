@@ -1,20 +1,30 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[derive(Default)]
 pub enum CoreType {
     #[serde(rename = "mihomo")]
     #[default]
     Mihomo,
-    #[serde(rename = "singbox")]
-    Singbox,
+}
+impl<'de> Deserialize<'de> for CoreType {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "mihomo" => Ok(Self::Mihomo),
+            "singbox" | "sing-box" => {
+                log::warn!("The legacy core selection is no longer supported; using Mihomo");
+                Ok(Self::Mihomo)
+            }
+            _ => Err(serde::de::Error::custom("Only Mihomo is supported")),
+        }
+    }
 }
 impl std::fmt::Display for CoreType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CoreType::Mihomo => write!(f, "mihomo"),
-            CoreType::Singbox => write!(f, "sing-box"),
         }
     }
 }
@@ -49,20 +59,10 @@ pub struct MihomoSection {
     pub core_service: CoreServiceConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(default)]
-pub struct SingboxSection {
-    #[serde(default)]
-    pub core: CoreConfig,
-    #[serde(default)]
-    pub core_service: CoreServiceConfig,
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ConfigFile {
     pub mihomo: MihomoSection,
-    pub singbox: SingboxSection,
     pub timeout: Option<u64>,
     pub extra: Extra,
 }
@@ -90,18 +90,7 @@ impl Default for ConfigFile {
                         service_controller: None,
                     },
                 },
-                singbox: SingboxSection {
-                    core: CoreConfig {
-                        config_dir: format!("{base}/sing-box/config"),
-                        bin_path: format!("{base}/sing-box/sing-box.exe"),
-                        config_path: format!("{base}/sing-box/config/config.json"),
-                    },
-                    core_service: CoreServiceConfig {
-                        service_name: "clashtui_singbox".into(),
-                        is_user: false,
-                        service_controller: None,
-                    },
-                },
+
                 timeout: Default::default(),
                 extra: Default::default(),
             }
@@ -120,18 +109,7 @@ impl Default for ConfigFile {
                     service_controller: None,
                 },
             },
-            singbox: SingboxSection {
-                core: CoreConfig {
-                    config_dir: "/opt/clashtui/sing-box/config".into(),
-                    bin_path: "/opt/clashtui/sing-box/sing-box".into(),
-                    config_path: "/opt/clashtui/sing-box/config/config.json".into(),
-                },
-                core_service: CoreServiceConfig {
-                    service_name: "clashtui_singbox".into(),
-                    is_user: false,
-                    service_controller: None,
-                },
-            },
+
             timeout: Default::default(),
             extra: Default::default(),
         }
@@ -223,10 +201,13 @@ impl BasicInfo {
     pub const DEFAULT: &str = "external-controller: 127.0.0.1:9090\nmixed-port: 7890";
 
     pub fn get_external_controller(&self) -> String {
-        let str = match self.external_controller.strip_prefix("http://") {
-            Some(str) => str,
-            None => self.external_controller.as_str(),
-        };
+        if self.external_controller.starts_with("https://") {
+            return self.external_controller.clone();
+        }
+        let str = self
+            .external_controller
+            .strip_prefix("http://")
+            .unwrap_or(&self.external_controller);
         if let Some(after) = str.strip_prefix("0.0.0.0") {
             format!("http://{}{}", Self::LOCALHOST, after)
         } else {
@@ -257,14 +238,6 @@ mod test {
   core_service:
     service_name: clashtui_mihomo
     is_user: false
-singbox:
-  core:
-    bin_path: /opt/clashtui/sing-box/sing-box
-    config_dir: /opt/clashtui/sing-box/config
-    config_path: /opt/clashtui/sing-box/config/config.json
-  core_service:
-    service_name: clashtui_singbox
-    is_user: false
 timeout: 5
 extra:
   edit_cmd: kitty -e nvim "%s"
@@ -279,13 +252,6 @@ extra:
         );
         assert_eq!(cfg.mihomo.core_service.service_name, "clashtui_mihomo");
         assert!(!cfg.mihomo.core_service.is_user);
-        assert_eq!(cfg.singbox.core.bin_path, "/opt/clashtui/sing-box/sing-box");
-        assert_eq!(cfg.singbox.core.config_dir, "/opt/clashtui/sing-box/config");
-        assert_eq!(
-            cfg.singbox.core.config_path,
-            "/opt/clashtui/sing-box/config/config.json"
-        );
-        assert_eq!(cfg.singbox.core_service.service_name, "clashtui_singbox");
         assert_eq!(cfg.timeout, Some(5));
         assert_eq!(cfg.extra.edit_cmd.as_deref(), Some(r#"kitty -e nvim "%s""#));
         assert_eq!(
@@ -296,12 +262,11 @@ extra:
         let serialized = serde_yml::to_string(&cfg).unwrap();
         let deser: ConfigFile = serde_yml::from_str(&serialized).unwrap();
         assert_eq!(deser.mihomo.core.config_dir, cfg.mihomo.core.config_dir);
-        assert_eq!(deser.singbox.core.bin_path, cfg.singbox.core.bin_path);
     }
 
     #[test]
     fn config_file_defaults() {
-        let yaml = "mihomo: {}\nsingbox: {}";
+        let yaml = "mihomo: {}";
         let cfg: ConfigFile = serde_yml::from_str(yaml).unwrap();
         assert_eq!(cfg.mihomo.core.config_dir, "");
         assert_eq!(cfg.mihomo.core_service.service_name, "");
@@ -594,7 +559,6 @@ open_dir_cmd: ""
         let deser: ConfigFile = serde_yml::from_str(&serialized).unwrap();
         assert_eq!(deser.mihomo.core.config_dir, cfg.mihomo.core.config_dir);
         assert_eq!(deser.mihomo.core.bin_path, cfg.mihomo.core.bin_path);
-        assert_eq!(deser.singbox.core.bin_path, cfg.singbox.core.bin_path);
         assert_eq!(deser.timeout, cfg.timeout);
         assert_eq!(deser.extra.edit_cmd, cfg.extra.edit_cmd);
         assert_eq!(
@@ -612,11 +576,6 @@ open_dir_cmd: ""
         assert_eq!(cfg.mihomo.core_service.service_name, "");
         assert!(!cfg.mihomo.core_service.is_user);
         assert_eq!(cfg.mihomo.core_service.service_controller, None);
-        assert_eq!(cfg.singbox.core.config_dir, "");
-        assert_eq!(cfg.singbox.core.bin_path, "");
-        assert_eq!(cfg.singbox.core.config_path, "");
-        assert_eq!(cfg.singbox.core_service.service_name, "");
-        assert!(!cfg.singbox.core_service.is_user);
         assert_eq!(cfg.timeout, None);
         assert_eq!(cfg.extra.edit_cmd, None);
         assert_eq!(cfg.extra.open_dir_cmd, None);
@@ -628,44 +587,6 @@ open_dir_cmd: ""
         assert_eq!(cfg.mihomo.core.config_dir, "/opt/mihomo");
         assert_eq!(cfg.mihomo.core_service.service_name, "mihomo_svc");
         assert!(cfg.mihomo.core_service.is_user);
-        assert_eq!(cfg.timeout, None);
-        assert_eq!(cfg.extra.edit_cmd, None);
-        assert_eq!(cfg.extra.open_dir_cmd, None);
-    }
-
-    #[test]
-    fn config_fixture_singbox_full() {
-        let cfg = load_config_fixture("sing-box/full.yaml");
-        assert_eq!(cfg.singbox.core.config_dir, "/opt/clashtui/sing-box/config");
-        assert_eq!(cfg.singbox.core.bin_path, "/opt/clashtui/sing-box/sing-box");
-        assert_eq!(
-            cfg.singbox.core.config_path,
-            "/opt/clashtui/sing-box/config/config.json"
-        );
-        assert_eq!(cfg.singbox.core_service.service_name, "clashtui_singbox");
-        assert!(!cfg.singbox.core_service.is_user);
-        assert_eq!(
-            cfg.singbox.core_service.service_controller.as_deref(),
-            Some("openrc")
-        );
-        assert_eq!(cfg.timeout, Some(30));
-        assert_eq!(cfg.extra.edit_cmd.as_deref(), Some(r#"nvim "%s""#));
-        assert_eq!(cfg.extra.open_dir_cmd.as_deref(), Some(r#"lf "%s""#));
-    }
-
-    #[test]
-    fn config_fixture_singbox_minimal_empty_strings() {
-        let cfg = load_config_fixture("sing-box/minimal.yaml");
-        assert_eq!(cfg.mihomo.core.config_dir, "");
-        assert_eq!(cfg.mihomo.core.bin_path, "");
-        assert_eq!(cfg.mihomo.core.config_path, "");
-        assert_eq!(cfg.mihomo.core_service.service_name, "");
-        assert!(!cfg.mihomo.core_service.is_user);
-        assert_eq!(cfg.singbox.core.config_dir, "");
-        assert_eq!(cfg.singbox.core.bin_path, "");
-        assert_eq!(cfg.singbox.core.config_path, "");
-        assert_eq!(cfg.singbox.core_service.service_name, "");
-        assert!(!cfg.singbox.core_service.is_user);
         assert_eq!(cfg.timeout, None);
         assert_eq!(cfg.extra.edit_cmd, None);
         assert_eq!(cfg.extra.open_dir_cmd, None);

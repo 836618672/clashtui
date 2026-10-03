@@ -11,13 +11,14 @@
 
 [clashtui_demo.webm](https://github.com/user-attachments/assets/51d3ee85-b1f4-4d02-9a43-623153e3825b)
 
-Language: [English](./README.md) | [中文](./README_ZH.md)
+Language: [English](README.md) | [中文](README_ZH.md)
 
-ClashTui is a terminal user interface (TUI) proxy management tool supporting both **Mihomo** (Clash.Meta) and **sing-box** proxy cores. Switch nodes, update subscriptions, manage connections, and control services — all from the terminal.
+ClashTui is a terminal user interface (TUI) proxy management tool supporting the **Mihomo** (Clash.Meta) proxy core. Switch nodes, update subscriptions, manage connections, and control services — all from the terminal.
 
 ## Features
 
-- **Dual Core Support** — Compatible with both Mihomo and sing-box; switch anytime in the UI
+- **Mihomo Management** — Manage the Mihomo core from the CLI, TUI and Web
+- **Legacy Data Migration** — Existing Mihomo profiles are retained and legacy databases are backed up before rewriting; see the [migration notes (Chinese)](docs/reference/mihomo_only_migration_zh.md)
 - **Subscription Management** — Supports File, URL, and Template (ClashTui template) profile types
 - **Proxy Switching** — Switch by group or by node, with latency testing
 - **Connection Monitoring** — View all active connections in real time; close individual or all connections
@@ -25,7 +26,7 @@ ClashTui is a terminal user interface (TUI) proxy management tool supporting bot
 - **Log Viewing** — View core logs in real time within the interface
 - **CLI Mode** — Supports `profile`, `mode`, `service`, `update` subcommands for scripting and automation
 - **Config Override** — Override final config via `core_override_config` without modifying original subscription files
-- **Template System** — Auto-generate config files using templates + proxy node groups, with variable expansion (recommended for sing-box to avoid configuration version issues)
+- **Template System** — Auto-generate config files using templates + proxy node groups, with variable expansion
 - **Custom Key Bindings** — Customize shortcuts for each tab via `keymap.yaml`
 - **Custom themes** - user-definable via theme.yaml
 - **which panel** - convenient for user operations
@@ -55,25 +56,24 @@ Windows:
 1. \[Optional\] Install mihomo and clashtui from your package repository:
 
 ```sh
-sudo pacman -S mihomo sing-box clashtui  # ArchLinux
+sudo pacman -S mihomo clashtui  # ArchLinux
 ```
 
-This step ensures mihomo, sing-box, and clashtui are available in your environment so the install script will skip downloading them. You can also download them manually and run `which mihomo sing-box clashtui` to verify they are correctly configured.
+This step ensures mihomo and clashtui are available in your environment so the install script will skip downloading them. You can also download them manually and run `which mihomo clashtui` to verify they are correctly configured.
 
 2. Run the install script:
 
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install) --core all
+bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install) --core mihomo
 ```
 
 Tip: The install script downloads resources from GitHub. If downloads keep failing, try enabling a proxy before running the script.
 
-3. \[Optional\] Enable `clashtui_mihomo.service` / `clashtui_singbox.service` on boot:
+3. \[Optional\] Enable `clashtui_mihomo.service` on boot:
 
 ```sh
 sudo systemctl enable clashtui_mihomo.service
 # OR
-sudo systemctl enable clashtui_singbox.service
 ```
 
 #### macOS
@@ -81,21 +81,20 @@ sudo systemctl enable clashtui_singbox.service
 1. \[Optional\] Install mihomo and clashtui from Homebrew:
 
 ```sh
-brew install mihomo sing-box # Note: clashtui was NOT uploaded, please install it manually
+brew install mihomo # Note: clashtui was NOT uploaded, please install it manually
 ```
 
 2. Run the install script (same as Linux):
 
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install) --core all
+bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install) --core mihomo
 ```
 
-3. \[Optional\] Enable `clashtui_mihomo` / `clashtui_singbox` launchd plists on boot:
+3. \[Optional\] Enable `clashtui_mihomo` launchd plists on boot:
 
 ```sh
 sudo launchctl load -w /Library/LaunchDaemons/clashtui_mihomo.plist
 # OR
-sudo launchctl load -w /Library/LaunchDaemons/clashtui_singbox.plist
 ```
 
 #### Windows
@@ -103,12 +102,12 @@ sudo launchctl load -w /Library/LaunchDaemons/clashtui_singbox.plist
 1. \[Optional\] Install mihomo and clashtui from Scoop:
 
 ```powershell
-scoop install mihomo sing-box clashtui
+scoop install mihomo clashtui
 # Verify
-Get-Command mihomo sing-box clashtui
+Get-Command mihomo clashtui
 ```
 
-This step ensures mihomo, sing-box, and clashtui are in PATH so the install script will skip downloading them.
+This step ensures mihomo and clashtui are in PATH so the install script will skip downloading them.
 
 2. Run the install script (as Administrator):
 
@@ -117,7 +116,7 @@ This step ensures mihomo, sing-box, and clashtui are in PATH so the install scri
 irm https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install.ps1 | iex
 
 # Custom directory (no spaces allowed)
-iex "& {$(irm https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install.ps1)} -Core all -InstallDir 'D:\MyTools\ClashTui'"
+iex "& {$(irm https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install.ps1)} -Core mihomo -InstallDir 'D:\MyTools\ClashTui'"
 
 # Only install mihomo core
 iex "& {$(irm https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install.ps1)} -Core mihomo"
@@ -132,7 +131,7 @@ The install script does NOT register Windows Services. Launch clashtui and use t
 #### Linux
 
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install) --core all --is-user
+bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install) --core mihomo --is-user
 ```
 
 Enable on boot:
@@ -140,13 +139,12 @@ Enable on boot:
 ```sh
 systemctl --user enable clashtui_mihomo.service
 # OR
-systemctl --user enable clashtui_singbox.service
 ```
 
 #### macOS
 
 ```sh
-bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install) --core all --is-user
+bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/main/installs/install) --core mihomo --is-user
 ```
 
 Enable on boot:
@@ -154,7 +152,6 @@ Enable on boot:
 ```sh
 launchctl load -w ~/Library/LaunchAgents/clashtui_mihomo.plist
 # OR
-launchctl load -w ~/Library/LaunchAgents/clashtui_singbox.plist
 ```
 
 ## FAQ
@@ -164,18 +161,22 @@ launchctl load -w ~/Library/LaunchAgents/clashtui_singbox.plist
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [Getting Started](docs/getting_started_en.md) | Detailed usage guide: UI operations, CLI, subscription management, config reference, FAQ |
-| [Manual Installation](docs/install_manually_en.md) | Step-by-step manual installation for system/user mode |
-| [Feature Design](docs/ClashTui_feature_design_en.md) | Feature design: config structure, subscription management, Template expansion, sing-box merge algorithm |
-| [Architecture](docs/architecture_en.md) | Code architecture: module structure, startup flow, TUI event loop, Tab system |
-| [Development Conventions](docs/development_conventions.md) | Branch naming, commit format, CHANGELOG conventions |
+Start with the [documentation index](docs/README.md). Current guides, testing instructions and historical records are grouped by purpose.
+
+| Entry | Purpose |
+|---|---|
+| [Getting Started](docs/guides/getting_started_en.md) | TUI, CLI, subscriptions and configuration |
+| [Manual Configuration](docs/guides/install_manually_en.md) | Prepare Mihomo and ClashTui configuration |
+| [Current Status (Chinese)](docs/reference/project_status_zh.md) | Scope, completed verification and remaining acceptance |
+| [Test Plan (Chinese)](docs/testing/README.md) | Automate on the headless mini PC; use a Mac only for six optional human experience checks |
+| [Architecture](docs/development/architecture_en.md) | Code structure; [feature design](docs/development/clashtui_feature_design_en.md) |
+
+[Automated testing](docs/testing/test_pipeline_zh.md), [VM operations](docs/testing/local_vm_testing_zh.md) and the [historical archive](docs/archive/README.md) are currently documented in Chinese.
 
 ## Contributing
 
-Issues and pull requests are welcome. Please read the [Development Conventions](docs/development_conventions.md) before contributing.
+Issues and pull requests are welcome. Please read the [Development Conventions](docs/development/development_conventions.md) before contributing.
 
 To get up to speed quickly:
-1. [Feature Design](docs/ClashTui_feature_design_en.md) — understand the feature design
-2. [Architecture](docs/architecture_en.md) — understand the code structure
+1. [Feature Design](docs/development/clashtui_feature_design_en.md) — understand the feature design
+2. [Architecture](docs/development/architecture_en.md) — understand the code structure

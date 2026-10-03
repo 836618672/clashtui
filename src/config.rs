@@ -5,16 +5,13 @@
 //! * [`ConfigFile`] config.yaml
 //! * `Folder` mihomo/profiles/
 //! * `Folder` mihomo/templates/
-//! * `Folder` sing-box/profiles/
-//! * `Folder` sing-box/templates/
-//! * `Folder` sing-box/proxy-providers/
 
 use anyhow::{Context, Result, ensure};
 use core::*;
 use database::*;
 use std::{
     path::PathBuf,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     sync::{Mutex, OnceLock},
 };
 use util::*;
@@ -29,6 +26,15 @@ pub mod database;
 pub const CONFIG: Wrapper = Wrapper;
 
 static CORE_MISMATCH: AtomicBool = AtomicBool::new(false);
+static CORE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub fn core_generation() -> u64 {
+    CORE_GENERATION.load(Ordering::Acquire)
+}
+
+pub fn initialized() -> bool {
+    _CONFIG.get().is_some()
+}
 
 /// Set when StatusTab detects the API is serving data from a different core
 /// than the configured one.
@@ -67,8 +73,6 @@ pub struct Config {
     pub proxy_addr: String,
     pub secret: Option<String>,
     pub global_ua: Option<String>,
-    pub singbox_external_controller: String,
-    pub singbox_secret: Option<String>,
 }
 
 impl Config {
@@ -84,10 +88,16 @@ impl Config {
                 let tpl_path = template_path().join(&template_name);
                 if tpl_path.exists() {
                     // Only write if the template file doesn't already have clashtui.proxy_provider_groups
-                    let existing =
-                        crate::functions::file::template::read_template_ppg(&template_name)
-                            .unwrap_or_default();
-                    if existing.is_empty() {
+                    let has_groups = std::fs::read_to_string(&tpl_path)
+                        .ok()
+                        .and_then(|text| serde_yml::from_str::<serde_yml::Value>(&text).ok())
+                        .is_some_and(|value| {
+                            value
+                                .get("clashtui")
+                                .and_then(|v| v.get("proxy_provider_groups"))
+                                .is_some()
+                        });
+                    if !has_groups {
                         if let Err(e) = crate::functions::file::template::write_template_ppg(
                             &template_name,
                             &groups,
@@ -127,52 +137,6 @@ impl Config {
                     .display()
                     .to_string();
         }
-        if !cfg_file.singbox.core.config_dir.is_empty() {
-            cfg_file.singbox.core.config_dir =
-                std::path::absolute(std::path::PathBuf::from(&cfg_file.singbox.core.config_dir))
-                    .context("Failed to resolve singbox config_dir")?
-                    .display()
-                    .to_string();
-        }
-        if !cfg_file.singbox.core.config_path.is_empty() {
-            cfg_file.singbox.core.config_path =
-                std::path::absolute(std::path::PathBuf::from(&cfg_file.singbox.core.config_path))
-                    .context("Failed to resolve singbox config_path")?
-                    .display()
-                    .to_string();
-        }
-        let (singbox_controller, singbox_secret) = {
-            let mut secret = None;
-            let controller = load_basic_singbox()
-                .ok()
-                .and_then(|v| {
-                    let controller = v
-                        .get("experimental")?
-                        .get("clash_api")?
-                        .get("external_controller")?
-                        .as_str()?
-                        .to_owned();
-                    secret = v
-                        .get("experimental")
-                        .and_then(|e| e.get("clash_api"))
-                        .and_then(|c| c.get("secret"))
-                        .and_then(|s| s.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_owned());
-                    if let Some(stripped) = controller.strip_prefix("http://") {
-                        Some(stripped.to_owned())
-                    } else {
-                        Some(controller)
-                    }
-                })
-                .unwrap_or_else(|| "127.0.0.1:9090".to_owned());
-            let url = if controller.starts_with("http") {
-                controller
-            } else {
-                format!("http://{controller}")
-            };
-            (url, secret)
-        };
         Ok(Self {
             cfg_file,
             data,
@@ -182,26 +146,19 @@ impl Config {
                 .context("Failed to determine proxy port")?,
             secret: basic_info.secret,
             global_ua: basic_info.global_ua,
-            singbox_external_controller: singbox_controller,
-            singbox_secret,
         })
     }
     pub fn core_type(&self) -> CoreType {
         self.data.lock().unwrap().core_type
     }
-    pub fn save(&self) -> Result<()> {
-        self.data.lock().unwrap().to_file()
-    }
     pub fn controller_for_core(&self) -> &str {
         match self.data.lock().unwrap().core_type {
             CoreType::Mihomo => &self.external_controller,
-            CoreType::Singbox => &self.singbox_external_controller,
         }
     }
     pub fn secret_for_core(&self) -> Option<&str> {
         match self.data.lock().unwrap().core_type {
             CoreType::Mihomo => self.secret.as_deref(),
-            CoreType::Singbox => self.singbox_secret.as_deref(),
         }
     }
 }
@@ -226,17 +183,16 @@ pub fn init(base_path: Option<PathBuf>) -> Result<()> {
         std::path::absolute(&path).context(format!("{} is not an absolute path", path.display()))?
     };
 
-    let is_first_run = !config_root.join(defs::CONFIG_FILE).exists();
-
     std::fs::create_dir_all(config_root.join("mihomo"))
         .context("Failed to create mihomo data directory")?;
-    std::fs::create_dir_all(config_root.join("sing-box"))
-        .context("Failed to create sing-box data directory")?;
 
     CONFIG_ROOT.set(config_root.clone()).ok();
     if DATA_DIR.set(config_root).is_err() {
         unreachable!("init twice")
     }
+
+    let _write = crate::functions::file::coordination::WriteGuard::acquire()?;
+    let is_first_run = !config_dir_path().join(defs::CONFIG_FILE).exists();
 
     if is_first_run {
         init_config()?;
@@ -251,11 +207,6 @@ pub fn init(base_path: Option<PathBuf>) -> Result<()> {
         if !mihomo_override.exists() {
             fs::write(&mihomo_override, BasicInfo::DEFAULT)
                 .with_context(|| format!("Failed to write {}", mihomo_override.display()))?;
-        }
-        let singbox_override = path.join("sing-box").join(defs::CORE_OVERRIDE_SINGBOX_FILE);
-        if !singbox_override.exists() {
-            fs::write(&singbox_override, DEFAULT_SINGBOX_BASIC_CONFIG)
-                .with_context(|| format!("Failed to write {}", singbox_override.display()))?;
         }
         let db = path.join(defs::DATA_FILE);
         if !db.exists() {
@@ -278,24 +229,15 @@ pub fn init_config() -> Result<()> {
         None => unreachable!(),
     };
     let mihomo = path.join("mihomo");
-    let singbox = path.join("sing-box");
 
     fs::create_dir_all(&mihomo)?;
-    fs::create_dir_all(&singbox)?;
 
     fs::write(mihomo.join(defs::CORE_OVERRIDE_FILE), BasicInfo::DEFAULT)?;
-    fs::write(
-        singbox.join(defs::CORE_OVERRIDE_SINGBOX_FILE),
-        DEFAULT_SINGBOX_BASIC_CONFIG,
-    )?;
     ConfigFile::default().to_file()?;
     ProfileManager::default().to_file()?;
 
     fs::create_dir(mihomo.join(defs::TEMPLATE_DIR))?;
     fs::create_dir(mihomo.join(defs::PROFILE_YAMLS_DIR))?;
-    fs::create_dir(singbox.join(defs::TEMPLATE_DIR))?;
-    fs::create_dir(singbox.join(defs::PROFILE_JSONS_DIR))?;
-    fs::create_dir(singbox.join(defs::PROXY_PROVIDERS_DIR))?;
 
     Ok(())
 }
@@ -307,74 +249,105 @@ pub fn theme_path() -> PathBuf {
 fn mihomo_dir() -> PathBuf {
     DATA_DIR.get().unwrap().join("mihomo")
 }
-fn singbox_dir() -> PathBuf {
-    DATA_DIR.get().unwrap().join("sing-box")
-}
+
 pub fn config_dir_path() -> PathBuf {
     DATA_DIR.get().unwrap().clone()
 }
 pub fn core_data_dir(core_type: CoreType) -> PathBuf {
     match core_type {
         CoreType::Mihomo => mihomo_dir(),
-        CoreType::Singbox => singbox_dir(),
     }
 }
 pub fn template_path() -> PathBuf {
     mihomo_dir().join(defs::TEMPLATE_DIR)
 }
-pub fn singbox_template_path() -> PathBuf {
-    singbox_dir().join(defs::TEMPLATE_DIR)
-}
+
 pub fn profile_yamls_path() -> PathBuf {
     mihomo_dir().join(defs::PROFILE_YAMLS_DIR)
 }
-pub fn profile_jsons_path() -> PathBuf {
-    singbox_dir().join(defs::PROFILE_JSONS_DIR)
-}
-pub fn singbox_proxy_providers_path() -> PathBuf {
-    singbox_dir().join(defs::PROXY_PROVIDERS_DIR)
-}
-pub fn singbox_core_override_path() -> PathBuf {
-    singbox_dir().join(defs::CORE_OVERRIDE_SINGBOX_FILE)
-}
+
 pub fn load_basic() -> anyhow::Result<serde_yml::Mapping> {
     let fp = std::fs::File::open(mihomo_dir().join(defs::CORE_OVERRIDE_FILE))?;
     serde_yml::from_reader(fp).map_err(|e| e.into())
 }
-pub fn load_basic_singbox() -> anyhow::Result<serde_json::Value> {
-    let fp = std::fs::File::open(singbox_dir().join(defs::CORE_OVERRIDE_SINGBOX_FILE))?;
-    serde_json::from_reader(fp).map_err(|e| e.into())
-}
-pub const DEFAULT_SINGBOX_BASIC_CONFIG: &str = r#"{
-  "experimental": {
-    "clash_api": {
-      "external_controller": "127.0.0.1:9090",
-      "secret": ""
-    }
-  },
-  "inbounds": [
-    {
-      "type": "mixed",
-      "tag": "mixed-in",
-      "listen": "::",
-      "listen_port": 7890
-    }
-  ],
-  "log": {
-    "level": "info"
-  }
-}"#;
+
 pub fn keymap_path() -> PathBuf {
     DATA_DIR.get().unwrap().join(defs::KEYMAP_FILE)
 }
 
 load_save!(BasicInfo, defs::CORE_OVERRIDE_FILE, no_save, "mihomo");
 load_save!(ConfigFile, defs::CONFIG_FILE);
-load_save!(ProfileManager, defs::DATA_FILE);
+impl ProfileManager {
+    pub fn from_file() -> Result<Self> {
+        let path = DATA_DIR.get().unwrap().join(defs::DATA_FILE);
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("Failed to read {}", path.display()))?;
+        Self::from_compatible_database(&path, &bytes)
+    }
+
+    fn from_compatible_database(path: &std::path::Path, bytes: &[u8]) -> Result<Self> {
+        let raw: serde_yml::Mapping = serde_yml::from_slice(bytes)?;
+        let database: Self = serde_yml::from_slice(bytes)?;
+        let contains_legacy_data = raw
+            .keys()
+            .any(|key| !matches!(key.as_str(), Some("core_type" | "mihomo")))
+            || raw
+                .get("core_type")
+                .and_then(serde_yml::Value::as_str)
+                .is_some_and(|core| core != "mihomo");
+        if contains_legacy_data {
+            use std::io::Write;
+            let backup = path.with_extension("db.before-mihomo-only");
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&backup) {
+                Ok(mut file) => {
+                    file.write_all(bytes)?;
+                    file.sync_all()?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error).context("Could not preserve the legacy database"),
+            }
+        }
+        Ok(database)
+    }
+
+    pub fn to_file(&self) -> Result<()> {
+        let path = DATA_DIR.get().unwrap().join(defs::DATA_FILE);
+        let bytes = serde_yml::to_string(self)?.into_bytes();
+        if std::fs::read(&path).is_ok_and(|existing| existing == bytes) {
+            return Ok(());
+        }
+        crate::functions::file::activation::atomic_write(&path, &bytes)
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_selection_preserves_mihomo_profiles_and_original_database() {
+        let root = std::env::temp_dir().join(format!("clashtui-legacy-{:x}", fastrand::u64(..)));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("clashtui.db");
+        let bytes = b"core_type: singbox\nmihomo:\n  cur_profile: main\n  profiles:\n    main: File\nsingbox:\n  profiles:\n    old: Singbox\n";
+        let database = ProfileManager::from_compatible_database(&path, bytes).unwrap();
+        assert_eq!(database.core_type, CoreType::Mihomo);
+        assert_eq!(database.get_current().unwrap().name, "main");
+        assert_eq!(
+            std::fs::read(path.with_extension("db.before-mihomo-only")).unwrap(),
+            bytes
+        );
+        assert!(!serde_yml::to_string(&database).unwrap().contains("singbox"));
+        assert!(ProfileManager::from_compatible_database(&path, bytes).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn core_mismatch_flag_defaults_false() {
@@ -410,12 +383,6 @@ mod tests {
             mihomo_dir.ends_with("mihomo"),
             "expected path ending with 'mihomo', got: {mihomo_dir:?}"
         );
-
-        let singbox_dir = core_data_dir(CoreType::Singbox);
-        assert!(
-            singbox_dir.ends_with("sing-box"),
-            "expected path ending with 'sing-box', got: {singbox_dir:?}"
-        );
     }
 
     #[test]
@@ -424,8 +391,8 @@ mod tests {
         let parent = std::path::Path::new(config_dir).parent().unwrap();
         assert_eq!(parent, std::path::Path::new("/opt/clashtui/mihomo"));
 
-        let config_dir = "/opt/clashtui/sing-box/config";
+        let config_dir = "/opt/clashtui/mihomo/config";
         let parent = std::path::Path::new(config_dir).parent().unwrap();
-        assert_eq!(parent, std::path::Path::new("/opt/clashtui/sing-box"));
+        assert_eq!(parent, std::path::Path::new("/opt/clashtui/mihomo"));
     }
 }

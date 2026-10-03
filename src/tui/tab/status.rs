@@ -1,17 +1,32 @@
+use ratatui::layout::{Constraint, Layout};
 use ratatui::{text::Text, widgets::Paragraph};
 
 use super::dev::*;
 
 newtype_tab!(StatusTab(Tab<Status>));
 
-#[derive(Clone, Copy)]
-enum Key {}
+mod_agent!(
+    Key,
+    [
+        ([KeyCode::Char('w')], Key::OpenPanel, "Open MetaCubeXD"),
+        (
+            [KeyCode::Char('i')],
+            Key::PreparePanel,
+            "Prepare pinned MetaCubeXD panel"
+        ),
+    ]
+);
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub(crate) enum Key {
+    OpenPanel,
+    PreparePanel,
+}
 
 impl TryFrom<&crate::tui::Key> for Key {
     type Error = ();
 
-    fn try_from(_: &crate::tui::Key) -> Result<Self, Self::Error> {
-        Err(())
+    fn try_from(key: &crate::tui::Key) -> Result<Self, Self::Error> {
+        agent().get(key).copied().ok_or(())
     }
 }
 
@@ -48,6 +63,11 @@ struct Status {
     detected_core_type: Option<CoreType>,
     error: Option<String>,
     paused: bool,
+    metrics: restful::metrics::Metrics,
+    metrics_error: Option<String>,
+    memory: Option<u64>,
+    memory_sampled: Option<std::time::Instant>,
+    memory_error: Option<String>,
 }
 
 impl BasicTabContent for Status {
@@ -56,39 +76,81 @@ impl BasicTabContent for Status {
     type State = ();
 
     const TITLE: &str = "Status";
+    fn all_shortcuts() -> &'static [(KeyCombo, Key, &'static str)] {
+        agent::all_shortcuts()
+    }
 
     fn after_sync(&self, task_set: &mut FutureSet<Self>) {
-        if self.paused {
+        if self.paused || !task_set.is_empty() {
             return;
         }
-        async {
+        let sample_memory = self
+            .memory_sampled
+            .is_none_or(|time| time.elapsed() >= std::time::Duration::from_secs(30));
+        async move {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
 
             let version = tri!(
-                tokio::task::spawn_blocking(restful::control::version)
+                crate::functions::restful::session::spawn_blocking(restful::control::version)
                     .await
                     .unwrap(),
                 or_set
             );
             let config = tri!(
-                tokio::task::spawn_blocking(restful::config::fetch)
+                crate::functions::restful::session::spawn_blocking(restful::config::fetch)
                     .await
                     .unwrap(),
                 or_set
             );
             let detected = tri!(
-                tokio::task::spawn_blocking(restful::core_detect::detect_core_type)
-                    .await
-                    .unwrap(),
+                crate::functions::restful::session::spawn_blocking(
+                    restful::core_detect::detect_core_type
+                )
+                .await
+                .unwrap(),
                 or_set
             );
+
+            let metrics = crate::functions::restful::session::spawn_blocking(
+                restful::connection::get_connections,
+            )
+            .await;
+            let sample_time = std::time::Instant::now();
+            let memory = if sample_memory {
+                Some(
+                    crate::functions::restful::session::spawn_blocking(restful::stream::memory)
+                        .await,
+                )
+            } else {
+                None
+            };
 
             wrapper(move |content: &mut Self| {
                 let configured = CONFIG.core_type();
                 content.detected_core_type = Some(detected);
+                match metrics {
+                    Ok(Ok(info)) => {
+                        content.metrics.sample(&info, sample_time);
+                        content.metrics_error = None;
+                    }
+                    Ok(Err(error)) => content.metrics_error = Some(error.to_string()),
+                    Err(error) => content.metrics_error = Some(error.to_string()),
+                }
+                if let Some(memory) = memory {
+                    content.memory_sampled = Some(std::time::Instant::now());
+                    match memory {
+                        Ok(Ok(bytes)) => {
+                            content.memory = Some(bytes);
+                            content.memory_error = None;
+                        }
+                        Ok(Err(error)) => content.memory_error = Some(error.to_string()),
+                        Err(error) => content.memory_error = Some(error.to_string()),
+                    }
+                }
                 if detected == configured {
                     content.version = Some(version);
                     content.config = Some(config);
+                    content.error = None;
                     crate::config::set_core_mismatch(false);
                 } else {
                     content.error = Some(format!(
@@ -109,6 +171,7 @@ impl BasicTabContent for Status {
             match crate::functions::command::is_core_service_running() {
                 Some(false) => {
                     self.error = Some("Core service is not running".to_owned());
+                    self.after_sync(task_set);
                     return;
                 }
                 _ => {
@@ -119,19 +182,21 @@ impl BasicTabContent for Status {
 
         async {
             let detected = tri!(
-                tokio::task::spawn_blocking(restful::core_detect::detect_core_type)
-                    .await
-                    .unwrap(),
+                crate::functions::restful::session::spawn_blocking(
+                    restful::core_detect::detect_core_type
+                )
+                .await
+                .unwrap(),
                 or_set
             );
             let version = tri!(
-                tokio::task::spawn_blocking(restful::control::version)
+                crate::functions::restful::session::spawn_blocking(restful::control::version)
                     .await
                     .unwrap(),
                 or_set
             );
             let config = tri!(
-                tokio::task::spawn_blocking(restful::config::fetch)
+                crate::functions::restful::session::spawn_blocking(restful::config::fetch)
                     .await
                     .unwrap(),
                 or_set
@@ -169,10 +234,26 @@ impl TabContent for Status {
 
     fn handle_key_event(
         &mut self,
-        _key: Self::Key,
-        _task_set: &mut FutureSet<Self>,
+        key: Self::Key,
+        task_set: &mut FutureSet<Self>,
         _state: &mut Self::State,
     ) {
+        match key {
+            Key::OpenPanel => {
+                if let Err(error) = crate::functions::command::open_panel() {
+                    crate::tui::widget::popmsg::Confirm::err(error);
+                }
+            }
+            Key::PreparePanel => {
+                async {
+                    if crate::tui::widget::popmsg::Confirm::title("Prepare MetaCubeXD v1.273.1?".to_owned())
+                        .with_prompt("Download the locked release, verify SHA-256, then replace the panel directory. Enter confirms; Esc cancels.".to_owned())
+                        .build_and_send().await.is_err() { return do_nothing(); }
+                    if let Err(error) = crate::functions::restful::session::spawn_blocking(crate::functions::file::panel::prepare).await.unwrap() { crate::tui::widget::popmsg::Confirm::err(error); }
+                    do_nothing()
+                }.spawn_at(task_set);
+            }
+        }
     }
 
     fn render(&self, f: &mut Frame, area: Rect, _state: &mut Self::State) {
@@ -181,6 +262,19 @@ impl TabContent for Status {
             .title(Self::TITLE);
         let mut lines: Vec<String> = vec![];
         let configured = CONFIG.core_type();
+        lines.push(format!(
+            "MetaCubeXD target {} · {}/ui/ · w opens · i prepares",
+            crate::functions::file::panel::VERSION,
+            CONFIG.controller_for_core().trim_end_matches('/')
+        ));
+        let panel = crate::functions::file::panel::deployment_state();
+        lines.push(if panel["verified_install_record"] == true {
+            "Panel: pinned installation recorded (served assets require browser verification)"
+                .to_owned()
+        } else {
+            "Panel: installation version unknown; prepare the pinned release to record it"
+                .to_owned()
+        });
         if let Some(detected) = self.detected_core_type {
             if detected == configured {
                 lines.push(format!("core: {detected}"));
@@ -192,6 +286,29 @@ impl TabContent for Status {
         }
         let matched = self.detected_core_type.is_none_or(|d| d == configured);
         if matched {
+            if let Some(memory) = self.memory {
+                lines.push(format!(
+                    "memory: {memory} B{}",
+                    if self.memory_error.is_some() {
+                        " (stale)"
+                    } else {
+                        ""
+                    }
+                ));
+            } else if let Some(error) = &self.memory_error {
+                lines.push(format!("memory unavailable: {error}"));
+            }
+            lines.push(format!(
+                "connections: {} | download: {} B/s | upload: {} B/s",
+                self.metrics.connections, self.metrics.download_speed, self.metrics.upload_speed
+            ));
+            lines.push(format!(
+                "observed session: ↓ {} B / ↑ {} B",
+                self.metrics.download, self.metrics.upload
+            ));
+            if let Some(error) = &self.metrics_error {
+                lines.push(format!("metrics unavailable: {error}"));
+            }
             if let Some(ref ver) = self.version {
                 lines.push(format!("version: {ver}"));
             }
@@ -208,6 +325,14 @@ impl TabContent for Status {
             );
         }
         let widget = Paragraph::new(Text::from_iter(lines)).block(block);
-        f.render_widget(widget, area);
+        let areas = Layout::vertical([Constraint::Min(4), Constraint::Length(4)]).split(area);
+        f.render_widget(widget, areas[0]);
+        let history: Vec<u64> = self.metrics.history.iter().copied().collect();
+        f.render_widget(
+            ratatui::widgets::Sparkline::default()
+                .block(Block::bordered().title("Combined rate · last 120 samples · B/s"))
+                .data(&history),
+            areas[1],
+        );
     }
 }

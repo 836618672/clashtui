@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod functions;
+#[cfg(feature = "tui")]
 mod tui;
 
 fn main() {
@@ -13,7 +14,7 @@ fn main() {
 
     if let Err(e) = config::init(cmd.config_dir.clone()) {
         eprintln!("Failed to load Config\n{e}");
-        return;
+        std::process::exit(1);
     }
 
     // Handle CLI subcommands (profile, service, mode, update)
@@ -22,7 +23,6 @@ fn main() {
             eprintln!("Error: {e}");
             std::process::exit(1);
         }
-        config::CONFIG.save().unwrap();
         return;
     }
 
@@ -36,11 +36,12 @@ fn main() {
         .target(env_logger::Target::Pipe(Box::new(log_file)))
         .init();
 
-    tui::init().unwrap();
-
-    tui::App::serve().unwrap();
-
-    tui::restore().unwrap();
-
-    config::CONFIG.save().unwrap();
+    #[cfg(feature = "tui")]
+    {
+        tui::init().unwrap();
+        tui::App::serve().unwrap();
+        tui::restore().unwrap();
+    }
+    #[cfg(not(feature = "tui"))]
+    eprintln!("This build has no TUI. Use a CLI subcommand or build with --features tui.");
 }

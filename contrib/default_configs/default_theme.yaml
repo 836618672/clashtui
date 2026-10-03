@@ -1,6 +1,6 @@
 # Clashtui default theme
 # Copy this file to ~/.config/clashtui/theme.yaml to customize colors.
-# Core-specific sections (mihomo / sing-box) allow different palettes per core.
+# An optional mihomo section overrides the common palette.
 
 # ---- Tabbar (top tab bar) ----
 tabbar:
@@ -47,13 +47,8 @@ default:
 #   border: { fg: "#cccccc" }
 
 # ---- Core-specific overrides (optional) ----
-# When core_type is Mihomo, values under "mihomo" are merged in and "sing-box" is discarded.
-# When core_type is Singbox, the reverse happens.
+# Values under "mihomo" are merged into the common palette.
 
 # mihomo:
 #   default:
 #     border: { fg: "#00cc99" }
-
-# sing-box:
-#   default:
-#     border: { fg: "#4488ff" }

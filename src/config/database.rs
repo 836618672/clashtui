@@ -47,7 +47,6 @@ pub enum ProfileType {
     Template {
         template: String,
     },
-    Singbox,
 }
 
 impl serde::Serialize for ProfileType {
@@ -72,7 +71,6 @@ impl serde::Serialize for ProfileType {
                     &TplHelper { template },
                 )
             }
-            ProfileType::Singbox => serializer.serialize_unit_variant("ProfileType", 3, "Singbox"),
         }
     }
 }
@@ -97,8 +95,6 @@ impl<'de> serde::Deserialize<'de> for ProfileType {
             #[allow(dead_code)]
             #[serde(rename = "Generated")]
             Generated(String),
-            #[serde(rename = "Singbox")]
-            Singbox,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -126,7 +122,6 @@ impl<'de> serde::Deserialize<'de> for ProfileType {
                 log::warn!("Migrating deprecated ProfileType::Generated({name}) to Template.");
                 ProfileType::Template { template: name }
             }
-            Wire::Singbox => ProfileType::Singbox,
         })
     }
 }
@@ -191,7 +186,7 @@ impl<'de> serde::Deserialize<'de> for ProfileData {
     }
 }
 
-type ProfileDataMap = std::collections::HashMap<String, ProfileData>;
+type ProfileDataMap = std::collections::BTreeMap<String, ProfileData>;
 
 #[cfg_attr(test, derive(PartialEq))]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
@@ -205,41 +200,28 @@ pub struct CoreProfileData {
 
 #[cfg_attr(test, derive(PartialEq))]
 #[derive(serde::Serialize, serde::Deserialize, Debug, Default, Clone)]
-/// manage profiles with mihomo/singbox sections
+/// Manage Mihomo profiles
 pub struct ProfileManager {
     #[serde(default)]
     pub core_type: crate::config::CoreType,
     #[serde(default)]
     pub mihomo: CoreProfileData,
-    #[serde(default)]
-    pub singbox: CoreProfileData,
 }
 impl ProfileManager {
     pub fn active(&self) -> &CoreProfileData {
         match self.core_type {
             crate::config::CoreType::Mihomo => &self.mihomo,
-            crate::config::CoreType::Singbox => &self.singbox,
         }
     }
 
     pub fn active_mut(&mut self) -> &mut CoreProfileData {
         match self.core_type {
             crate::config::CoreType::Mihomo => &mut self.mihomo,
-            crate::config::CoreType::Singbox => &mut self.singbox,
         }
     }
 
     pub fn insert<S: AsRef<str>>(&mut self, name: S, dtype: ProfileType) -> Option<Profile> {
-        let db = &mut match dtype {
-            ProfileType::Singbox => &mut self.singbox,
-            ProfileType::Template { .. } if self.core_type == crate::config::CoreType::Singbox => {
-                &mut self.singbox
-            }
-            ProfileType::Url(_) if self.core_type == crate::config::CoreType::Singbox => {
-                &mut self.singbox
-            }
-            _ => &mut self.mihomo,
-        };
+        let db = &mut self.mihomo;
         db.profiles
             .insert(name.as_ref().into(), ProfileData::new(dtype))
             .map(|data| Profile {
@@ -266,7 +248,6 @@ impl ProfileManager {
     pub fn all_for_core(&self) -> Vec<String> {
         match self.core_type {
             crate::config::CoreType::Mihomo => self.mihomo.profiles.keys().cloned().collect(),
-            crate::config::CoreType::Singbox => self.singbox.profiles.keys().cloned().collect(),
         }
     }
     pub fn remove<S: AsRef<str>>(&mut self, name: S) -> Option<Profile> {
@@ -288,10 +269,6 @@ impl ProfileManager {
                 let name = self.mihomo.cur_profile.as_ref()?;
                 self.get(name)
             }
-            crate::config::CoreType::Singbox => {
-                let name = self.singbox.cur_profile.as_ref()?;
-                self.get(name)
-            }
         }
     }
     pub fn set_current(&mut self, pf: Profile) {
@@ -302,7 +279,6 @@ impl ProfileManager {
         );
         match self.core_type {
             crate::config::CoreType::Mihomo => self.mihomo.cur_profile = Some(name),
-            crate::config::CoreType::Singbox => self.singbox.cur_profile = Some(name),
         }
     }
     pub fn set_no_pp<S: AsRef<str>>(&mut self, name: S, no_pp: bool) {
@@ -324,22 +300,6 @@ mod test {
     use super::*;
 
     #[test]
-    fn same_named_profiles_are_isolated_by_active_core() {
-        let mut pm = ProfileManager::default();
-        pm.insert("shared", ProfileType::Url("https://mihomo.example".into()));
-        pm.core_type = crate::config::CoreType::Singbox;
-        pm.insert("shared", ProfileType::Url("https://singbox.example".into()));
-        pm.set_update_with_proxy("shared", true);
-        assert_eq!(
-            pm.get("shared").unwrap().dtype,
-            ProfileType::Url("https://singbox.example".into())
-        );
-        pm.remove("shared");
-        assert!(pm.get("shared").is_none());
-        pm.core_type = crate::config::CoreType::Mihomo;
-        assert!(!pm.get("shared").unwrap().update_with_proxy);
-    }
-    #[test]
     fn serde_template_deserialized_as_template() {
         let yaml = r#"core_type: mihomo
 mihomo:
@@ -347,8 +307,6 @@ mihomo:
     pf1: File
     pf2: !Url "https://raw.com"
     pf3: !Template {template: tpl.yaml}
-singbox:
-  profiles: {}
 "#;
         let db: ProfileManager = serde_yml::from_str(yaml).unwrap();
         assert_eq!(
@@ -375,8 +333,6 @@ singbox:
 mihomo:
   profiles:
     pf1: !Generated "my-tpl.yaml"
-singbox:
-  profiles: {}
 "#;
         let db: ProfileManager = serde_yml::from_str(yaml).unwrap();
         assert_eq!(
@@ -409,8 +365,6 @@ mihomo:
   profiles:
     pf1: File
     pf2: !Url "https://example.com"
-singbox:
-  profiles: {}
 "#;
         let db: ProfileManager = serde_yml::from_str(yaml).unwrap();
         assert!(!db.mihomo.profiles.get("pf1").unwrap().no_pp);
@@ -423,8 +377,6 @@ mihomo:
   profiles:
     pf1: {dtype: File, no_pp: true}
     pf2: {dtype: !Url "https://example.com", no_pp: false}
-singbox:
-  profiles: {}
 "#;
         let db: ProfileManager = serde_yml::from_str(yaml).unwrap();
         assert!(db.mihomo.profiles.get("pf1").unwrap().no_pp);
@@ -436,8 +388,6 @@ singbox:
 mihomo:
   profiles:
     pf1: {dtype: File}
-singbox:
-  profiles: {}
 "#;
         let db: ProfileManager = serde_yml::from_str(yaml).unwrap();
         assert!(!db.mihomo.profiles.get("pf1").unwrap().no_pp);
@@ -471,8 +421,6 @@ singbox:
 mihomo:
   profiles:
     pf1: {dtype: File, no_pp: true}
-singbox:
-  profiles: {}
 "#;
         let db: ProfileManager = serde_yml::from_str(yaml).unwrap();
         assert!(!db.mihomo.profiles.get("pf1").unwrap().update_with_proxy);

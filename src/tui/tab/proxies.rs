@@ -19,6 +19,11 @@ mod_agent!(
         ([KeyCode::Char('l')], Key::Expand, "Expand/Jump to group"),
         ([KeyCode::Enter], Key::Select, "Select"),
         (
+            [KeyCode::Char('u')],
+            Key::Unfix,
+            "Restore automatic selection"
+        ),
+        (
             [KeyCode::Char('g'), KeyCode::Char('g')],
             Key::GoTop,
             "Go to top"
@@ -84,6 +89,7 @@ pub enum Key {
     Parent,
     Expand,
     Select,
+    Unfix,
     GoTop,
     GoBottom,
     CollapseAll,

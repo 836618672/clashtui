@@ -27,6 +27,7 @@ mod_agent!(
         ([KeyCode::Char('p')], Key::TogglePause, "Pause/Resume"),
         ([KeyCode::Char('f')], Key::FzfFind, "Find"),
         ([KeyCode::Char('c')], Key::Clear, "Clear logs"),
+        ([KeyCode::Char('e')], Key::Export, "Export filtered logs"),
         (
             [KeyCode::Char('t'), KeyCode::Char('d')],
             Key::ToggleDebug,
@@ -65,6 +66,7 @@ pub enum Key {
     TogglePause,
     FzfFind,
     Clear,
+    Export,
     ToggleDebug,
     ToggleInfo,
     ToggleWarning,
@@ -149,6 +151,10 @@ impl Default for Logs {
             ws_pending: None,
             ws_level: Arc::new(Mutex::new(String::new())),
             ws_reconnect: Arc::new(AtomicBool::new(false)),
+            ws_error: Arc::default(),
+            active: false,
+            core_log_level: String::new(),
+            last_level_check: None,
         }
     }
 }
@@ -163,6 +169,10 @@ struct Logs {
     ws_pending: Option<Arc<Mutex<Vec<LogEntry>>>>,
     ws_level: Arc<Mutex<String>>,
     ws_reconnect: Arc<AtomicBool>,
+    ws_error: Arc<Mutex<Option<String>>>,
+    active: bool,
+    core_log_level: String,
+    last_level_check: Option<std::time::Instant>,
 }
 
 fn spawn_ws_logs(
@@ -171,38 +181,32 @@ fn spawn_ws_logs(
     pending: Arc<Mutex<Vec<LogEntry>>>,
     level: Arc<Mutex<String>>,
     reconnect: Arc<AtomicBool>,
+    error: Arc<Mutex<Option<String>>>,
 ) {
+    let session = crate::functions::restful::session::CoreSession::try_current();
     std::thread::spawn(move || {
-        let ws_scheme = if controller.starts_with("https") {
-            "wss"
-        } else {
-            "ws"
-        };
-        // Strip http(s):// prefix and trailing slash if any
-        let addr = controller
-            .strip_prefix("http://")
-            .or_else(|| controller.strip_prefix("https://"))
-            .unwrap_or(&controller)
-            .trim_end_matches('/');
-
         loop {
+            if session.as_ref().is_some_and(|s| !s.is_current()) {
+                return;
+            }
             let current_level = level.lock().unwrap().clone();
             reconnect.store(false, Ordering::Relaxed);
 
-            let url_str = if let Some(ref s) = secret {
-                format!("{ws_scheme}://{addr}/logs?token={s}&level={current_level}")
-            } else {
-                format!("{ws_scheme}://{addr}/logs?level={current_level}")
-            };
-
-            match tungstenite::connect(&url_str) {
-                Ok((mut ws, _)) => {
-                    // Set read timeout on inner TcpStream for periodic reconnect checks
-                    if let tungstenite::stream::MaybeTlsStream::Plain(stream) = ws.get_mut() {
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-                    }
-
+            let path = format!(
+                "/logs?level={}",
+                crate::functions::restful::resources::encode_path(&current_level)
+            );
+            match crate::functions::restful::stream::connect(&controller, secret.as_deref(), &path)
+            {
+                Ok(mut ws) => {
+                    *error.lock().unwrap() = None;
                     loop {
+                        if session.as_ref().is_some_and(|s| !s.is_current()) {
+                            return;
+                        }
+                        if reconnect.load(Ordering::Relaxed) {
+                            break;
+                        }
                         match ws.read() {
                             Ok(tungstenite::Message::Text(text)) => {
                                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -216,7 +220,11 @@ fn spawn_ws_logs(
                                         .and_then(|p| p.as_str())
                                         .unwrap_or("")
                                         .to_owned();
-                                    pending.lock().unwrap().push(LogEntry {
+                                    let mut queue = pending.lock().unwrap();
+                                    if queue.len() >= LOG_BUFFER_SIZE {
+                                        queue.remove(0);
+                                    }
+                                    queue.push(LogEntry {
                                         type_,
                                         payload,
                                         time: api_log::timestamp(),
@@ -234,6 +242,7 @@ fn spawn_ws_logs(
                                 continue;
                             }
                             Err(e) => {
+                                *error.lock().unwrap() = Some(e.to_string());
                                 log::warn!("WebSocket read error: {e}");
                                 break;
                             }
@@ -242,6 +251,7 @@ fn spawn_ws_logs(
                     }
                 }
                 Err(e) => {
+                    *error.lock().unwrap() = Some(e.to_string());
                     log::warn!("WebSocket connect error: {e}");
                 }
             }
@@ -261,16 +271,13 @@ impl BasicTabContent for Logs {
     }
 
     fn on_enter(&mut self, task_set: &mut FutureSet<Self>, _state: &mut Self::State) {
-        if crate::config::is_core_mismatch() {
-            self.buffer.clear();
-            self.error = Some("API data mismatch with configured core".to_owned());
-            self.paused = true;
-            return;
-        }
+        self.active = true;
         // Refresh log level from core on every re-entry
         async {
             let cfg = tri!(
-                tokio::task::spawn_blocking(config::fetch).await.unwrap(),
+                crate::functions::restful::session::spawn_blocking(config::fetch)
+                    .await
+                    .unwrap(),
                 or_set
             );
             wrapper(move |content: &mut Self| {
@@ -283,25 +290,51 @@ impl BasicTabContent for Logs {
                     .map(|l| l.to_string())
                     .unwrap_or_else(|| "unknown".to_owned());
                 content.current_log_level = level.clone();
+                content.core_log_level = level.clone();
+                content.last_level_check = Some(std::time::Instant::now());
                 *content.ws_level.lock().unwrap() = level;
             })
         }
         .spawn_at(task_set);
     }
 
+    fn on_leave(&mut self, _tasks: &mut FutureSet<Self>, _state: &mut Self::State) {
+        self.active = false;
+    }
+
     fn after_sync(&self, task_set: &mut FutureSet<Self>) {
-        if self.paused {
+        if !task_set.is_empty() {
             return;
         }
-        if crate::config::is_core_mismatch() {
+        if self.paused || !self.active {
             return;
         }
         if let Some(ref pending) = self.ws_pending {
             let pending = Arc::clone(pending);
+            let error = Arc::clone(&self.ws_error);
+            let check_level = self
+                .last_level_check
+                .is_none_or(|time| time.elapsed() >= Duration::from_secs(2));
             async move {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 let entries: Vec<LogEntry> = pending.lock().unwrap().drain(..).collect();
+                let error = error.lock().unwrap().clone();
+                let config = if check_level {
+                    Some(crate::functions::restful::session::spawn_blocking(config::fetch).await)
+                } else {
+                    None
+                };
                 wrapper(move |content: &mut Self| {
+                    content.error = error;
+                    if let Some(config) = config {
+                        content.last_level_check = Some(std::time::Instant::now());
+                        if let Ok(Ok(config)) = config {
+                            content.core_log_level = config
+                                .log_level
+                                .map(|level| level.to_string())
+                                .unwrap_or_else(|| "unknown".to_owned());
+                        }
+                    }
                     for entry in entries {
                         content.buffer.push(entry);
                     }
@@ -325,13 +358,22 @@ impl TabContent for Logs {
         let secret = CONFIG.secret_for_core().map(|s| s.to_owned());
         let level = Arc::clone(&self.ws_level);
         let reconnect = Arc::clone(&self.ws_reconnect);
-        spawn_ws_logs(controller, secret, pending, level, reconnect);
+        spawn_ws_logs(
+            controller,
+            secret,
+            pending,
+            level,
+            reconnect,
+            Arc::clone(&self.ws_error),
+        );
 
         self.error = Some("Press p to start capturing logs".to_owned());
         // Fetch initial log level
         async {
             let cfg = tri!(
-                tokio::task::spawn_blocking(config::fetch).await.unwrap(),
+                crate::functions::restful::session::spawn_blocking(config::fetch)
+                    .await
+                    .unwrap(),
                 or_set
             );
             wrapper(move |content: &mut Self| {
@@ -344,6 +386,8 @@ impl TabContent for Logs {
                     .map(|l| l.to_string())
                     .unwrap_or_else(|| "unknown".to_owned());
                 content.current_log_level = level.clone();
+                content.core_log_level = level.clone();
+                content.last_level_check = Some(std::time::Instant::now());
                 *content.ws_level.lock().unwrap() = level;
                 content.error = None;
             })
@@ -404,7 +448,7 @@ impl TabContent for Logs {
                     .map(|e| format!("{} {} {}", e.time, e.type_, e.payload))
                     .collect();
                 async move {
-                    let selected = tokio::task::spawn_blocking(move || {
+                    let selected = crate::functions::restful::session::spawn_blocking(move || {
                         crate::tui::widget::fzffind::run_fzf(&names, "Find Log")
                     })
                     .await
@@ -422,6 +466,41 @@ impl TabContent for Logs {
                 self.scroll = 0;
                 self.filter = None;
             }
+            Key::Export => {
+                let entries: Vec<LogEntry> = self
+                    .buffer
+                    .iter_from_head()
+                    .filter(|entry| {
+                        self.filter.as_ref().is_none_or(|filter| {
+                            format!("{} {} {}", entry.time, entry.type_, entry.payload)
+                                .contains(filter)
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                async move {
+                    let path = tri!(
+                        Input::new()
+                            .with_title("Export logs to a new JSON file".to_owned())
+                            .build_and_send()
+                            .await,
+                        or_cancel
+                    );
+                    let result = crate::functions::restful::session::spawn_blocking(move || {
+                        crate::functions::file::export_json(
+                            std::path::Path::new(&path),
+                            &serde_json::to_value(entries)?,
+                        )
+                    })
+                    .await
+                    .unwrap();
+                    if let Err(error) = result {
+                        crate::tui::widget::popmsg::Confirm::err(error);
+                    }
+                    do_nothing()
+                }
+                .spawn_at(task_set);
+            }
             Key::ToggleDebug => self.toggle_log_level("debug", task_set),
             Key::ToggleInfo => self.toggle_log_level("info", task_set),
             Key::ToggleWarning => self.toggle_log_level("warning", task_set),
@@ -436,7 +515,13 @@ impl TabContent for Logs {
             .title(Self::TITLE);
 
         let mut title_parts = Vec::new();
-        title_parts.push(self.current_log_level.clone());
+        title_parts.push(format!(
+            "stream threshold: {} | core level: {}",
+            self.current_log_level, self.core_log_level
+        ));
+        if let Some(error) = &self.error {
+            title_parts.push(format!("[reconnecting: {error}]"));
+        }
         if let Some(ref filter) = self.filter {
             title_parts.push(format!(" / {filter} "));
         }

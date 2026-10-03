@@ -5,13 +5,31 @@ use std::process::{Command, Stdio};
 pub fn exec(pgm: &str, args: Vec<&str>) -> Result<String> {
     log::debug!("IPC: {} {:?}", pgm, args);
     let output = Command::new(pgm).args(args).output()?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Command {pgm} failed: {}",
+        stringify_output(output.clone())
+    );
     Ok(stringify_output(output))
 }
 
 pub fn exec_sudo(pgm: &str, args: Vec<&str>) -> Result<String> {
-    use crate::tui;
+    if super::BACKGROUND.with(|background| background.get()) {
+        let output = Command::new("sudo")
+            .arg("-n")
+            .arg(pgm)
+            .args(args)
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "Service command failed; configure non-interactive service permissions: {}",
+            stringify_output(output.clone())
+        );
+        return Ok(stringify_output(output));
+    }
     log::debug!("IPC: sudo -S {:?}", args);
-    tui::hold(true)?;
+    #[cfg(feature = "tui")]
+    crate::tui::hold(true)?;
     let mut child = Command::new("sudo")
         .arg(pgm)
         .args(args)
@@ -40,7 +58,13 @@ pub fn exec_sudo(pgm: &str, args: Vec<&str>) -> Result<String> {
     let mut output = child.wait_with_output()?;
     output.stderr = output_copy;
 
-    tui::hold(false)?;
+    #[cfg(feature = "tui")]
+    crate::tui::hold(false)?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Service command failed: {}",
+        stringify_output(output.clone())
+    );
     Ok(stringify_output(output))
 }
 
@@ -74,36 +98,122 @@ pub fn shell_spawn(cmd_template: &str, path: &str) -> Result<()> {
     if cmd_template.is_empty() {
         if cfg!(windows) {
             let path = sanitize_windows_path(path);
-            spawn("cmd", vec!["/c", "start", "", &path])
+            spawn("explorer", vec![&path])
         } else if cfg!(target_os = "macos") {
-            spawn("sh", vec!["-c", &format!("open \"{}\"", path)])
+            spawn("open", vec![path])
         } else {
-            spawn("sh", vec!["-c", &format!("xdg-open \"{}\"", path)])
+            spawn("xdg-open", vec![path])
         }
     } else if cfg!(windows) {
-        let path = sanitize_windows_path(path);
-        let cmd = cmd_template.replace("%s", &path);
-        log::debug!("SPW: cmd {} {}", "cmd", cmd);
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            Command::new("cmd")
-                .stderr(Stdio::null())
-                .stdout(Stdio::null())
-                .raw_arg("/c")
-                .raw_arg(&cmd)
-                .spawn()?;
-        }
-        Ok(())
+        // cmd.exe reparses arguments. A custom program plus one path argument
+        // avoids exposing document names to that parser.
+        let program = cmd_template
+            .strip_suffix(" %s")
+            .unwrap_or(cmd_template)
+            .trim_matches('"');
+        anyhow::ensure!(
+            !program.contains('%') && !program.contains(['&', '|', '<', '>']),
+            "Windows editor command must be a program path, optionally followed by %s"
+        );
+        spawn(program, vec![&sanitize_windows_path(path)])
     } else {
-        let cmd = cmd_template.replace("%s", path);
-        spawn("sh", vec!["-c", &cmd])
+        let cmd = positional_template(cmd_template)?;
+        spawn("sh", vec!["-c", &cmd, "clashtui-editor", path])
     }
+}
+
+#[cfg(all(unix, feature = "tui"))]
+pub fn edit_terminal(template: &str, path: &str) -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let command = positional_template(template)?;
+    anyhow::ensure!(
+        crate::tui::EXT_PROC
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok(),
+        "Another external process is running"
+    );
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = crate::tui::hold(false);
+            crate::tui::EXT_PROC.store(false, Ordering::SeqCst);
+        }
+    }
+    let _restore = Restore;
+    crate::tui::hold(true)?;
+    let status = Command::new("sh")
+        .args(["-c", &command, "clashtui-editor", path])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+    anyhow::ensure!(status.success(), "Editor exited unsuccessfully: {status}");
+    Ok(())
+}
+
+fn positional_template(template: &str) -> Result<String> {
+    // Custom shell syntax is trusted configuration; document paths are data.
+    anyhow::ensure!(
+        !template.contains('`') && !template.contains("$("),
+        "Editor templates with command substitution are unsupported; use a wrapper script"
+    );
+    let mut result = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut chars = template.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if !escaped && ch == '%' && chars.peek() == Some(&'s') {
+            chars.next();
+            result.push_str(match quote {
+                Some('\'') => "'\"$1\"'",
+                Some('"') => "$1",
+                _ => "\"$1\"",
+            });
+            continue;
+        }
+        result.push(ch);
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if Some(ch) == quote {
+            quote = None;
+        } else if quote.is_none() && matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+        }
+    }
+    anyhow::ensure!(
+        quote.is_none() && !escaped,
+        "Unclosed editor template quote or escape"
+    );
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_paths_are_one_literal_argument_in_each_quote_context() {
+        let path = "space ' quote \" ; $(touch /tmp/clashtui-should-not-exist) & *";
+        for template in ["printf '%s' %s", "printf '%s' '%s'", "printf '%s' \"%s\""] {
+            // The printf format itself has the placeholder syntax, so use a
+            // shell builtin with a literal output format assembled separately.
+            let argument = template.strip_prefix("printf '%s' ").unwrap();
+            let command = format!("printf '%s' {}", positional_template(argument).unwrap());
+            let output = Command::new("sh")
+                .args(["-c", &command, "test-editor", path])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), path);
+        }
+        assert!(positional_template("editor $(echo %s)").is_err());
+        assert!(positional_template("editor '%s").is_err());
+    }
 
     #[test]
     fn sanitize_unc_prefix_stripped() {

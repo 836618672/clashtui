@@ -22,5 +22,5 @@
 #     action: MoveUp
 #     desc: Move cursor up
 #
-# Core-specific sections (mihomo / sing-box) override common sections.
+# The mihomo section overrides common sections.
 {}

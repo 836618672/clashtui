@@ -1,6 +1,6 @@
 use serde_yml::Value;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub enum ResourceSection {
     ProxyProvider,
     RuleProvider,
@@ -21,9 +21,11 @@ pub struct NetResource {
     pub url: String,
     pub path: String,
     pub section: ResourceSection,
+    pub format: String,
+    pub behavior: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct NetResourceUpdate {
     pub name: String,
     pub url: String,
@@ -116,6 +118,16 @@ impl ExtractNetResources for serde_yml::Mapping {
                     url,
                     path,
                     section: section.clone(),
+                    format: provider_map
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .unwrap_or("yaml")
+                        .to_owned(),
+                    behavior: provider_map
+                        .get("behavior")
+                        .and_then(Value::as_str)
+                        .unwrap_or("classical")
+                        .to_owned(),
                 });
             }
         }
@@ -124,48 +136,174 @@ impl ExtractNetResources for serde_yml::Mapping {
     }
 }
 
-pub fn extract_singbox_net_resources(content: &serde_json::Value) -> Vec<NetResource> {
-    let mut resources = Vec::new();
+/// Resolve every cache access before touching the filesystem. Reject symlinks even
+/// when they currently point inside the root, so a later retarget cannot escape.
+pub fn cache_path(root: &std::path::Path, relative: &str) -> anyhow::Result<std::path::PathBuf> {
+    use std::path::Component;
+    anyhow::ensure!(!relative.is_empty(), "Provider cache path is empty");
+    let root = root.canonicalize()?;
+    let mut path = root.clone();
+    for component in std::path::Path::new(relative).components() {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(part) => path.push(part),
+            _ => {
+                anyhow::bail!("Provider cache path must stay inside the core directory: {relative}")
+            }
+        }
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => anyhow::ensure!(
+                !meta.file_type().is_symlink(),
+                "Provider cache path contains a symlink: {}",
+                path.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    anyhow::ensure!(path != root, "Provider cache path must name a file");
+    Ok(path)
+}
 
-    if let serde_json::Value::Array(outbounds) = &content["outbounds"] {
-        for outbound in outbounds {
-            let name = outbound["tag"].as_str().unwrap_or("unnamed");
-            if let Some(url) = outbound["outbound"]["url"].as_str()
-                && let Some(path) = outbound["outbound"]["path"].as_str()
-            {
-                resources.push(NetResource {
-                    name: name.to_owned(),
-                    url: url.to_owned(),
-                    path: path.to_owned(),
-                    section: ResourceSection::ProxyProvider,
-                });
+pub fn validate_cache_paths(mapping: &serde_yml::Mapping) -> anyhow::Result<()> {
+    let root = std::path::Path::new(&crate::config::CONFIG.cfg_file.mihomo.core.config_dir);
+    for section in ["proxy-providers", "rule-providers"] {
+        if let Some(providers) = mapping.get(section).and_then(Value::as_mapping) {
+            for provider in providers.values() {
+                if let Some(path) = provider.get("path").and_then(Value::as_str) {
+                    cache_path(root, path)?;
+                }
             }
         }
     }
+    Ok(())
+}
 
-    if let serde_json::Value::Array(rule_sets) = &content["route"]["rule_set"] {
-        for rule_set in rule_sets {
-            let tag = rule_set["tag"].as_str().unwrap_or("unnamed");
-            let is_remote = rule_set["type"].as_str() == Some("remote");
-            if is_remote && let Some(url) = rule_set["url"].as_str() {
-                let path = rule_set["path"].as_str().unwrap_or("rules.db");
-                resources.push(NetResource {
-                    name: tag.to_owned(),
-                    url: url.to_owned(),
-                    path: path.to_owned(),
-                    section: ResourceSection::RuleProvider,
-                });
-            }
+impl NetResource {
+    pub fn validate(&self, bytes: &[u8], destination: &std::path::Path) -> anyhow::Result<()> {
+        if self.section == ResourceSection::ProxyProvider || self.format == "yaml" {
+            let value: serde_yml::Mapping = serde_yml::from_slice(bytes)?;
+            let key = if self.section == ResourceSection::ProxyProvider {
+                "proxies"
+            } else {
+                "payload"
+            };
+            anyhow::ensure!(
+                value.get(key).and_then(Value::as_sequence).is_some(),
+                "Provider YAML requires a {key} sequence"
+            );
+        } else if self.format == "text" {
+            std::str::from_utf8(bytes)?;
+        } else if self.format == "mrs" {
+            anyhow::ensure!(
+                matches!(self.behavior.as_str(), "domain" | "ipcidr"),
+                "MRS requires domain or ipcidr behavior"
+            );
+            // Use Mihomo's decoder, including compressed payload integrity, rather
+            // than accepting a magic prefix as proof of a valid ruleset.
+            let payload = super::activation::TemporaryFile::create_beside(destination, bytes)?;
+            let converted = super::activation::TemporaryFile::create_beside(destination, b"")?;
+            let output =
+                std::process::Command::new(&crate::config::CONFIG.cfg_file.mihomo.core.bin_path)
+                    .args(["convert-ruleset", &self.behavior, "mrs"])
+                    .arg(&payload.0)
+                    .arg(&converted.0)
+                    .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Invalid MRS ruleset: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        } else {
+            anyhow::bail!("Unsupported rule provider format: {}", self.format);
         }
+        Ok(())
     }
 
-    resources
+    pub fn download(&self, with_proxy: bool) -> NetResourceUpdate {
+        let result = (|| -> anyhow::Result<()> {
+            let root = std::path::Path::new(&crate::config::CONFIG.cfg_file.mihomo.core.config_dir);
+            let destination = cache_path(root, &self.path)?;
+            let mut response = crate::functions::restful::download::profile(&self.url, with_proxy)?;
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut response, &mut bytes)?;
+            std::fs::create_dir_all(destination.parent().unwrap())?;
+            self.validate(&bytes, &destination)?;
+            let destination = cache_path(root, &self.path)?;
+            super::activation::atomic_write(&destination, &bytes)
+        })();
+        NetResourceUpdate {
+            name: self.name.clone(),
+            url: self.url.clone(),
+            path: self.path.clone(),
+            section: self.section.clone(),
+            ok: result.is_ok(),
+            error: result.err().map(|error| format!("{error:#}")),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::File;
+
+    #[test]
+    fn cache_paths_reject_escape_and_symlink_ancestors() {
+        let root = std::env::temp_dir().join(format!("clashtui-paths-{:x}", fastrand::u128(..)));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(cache_path(&root, "../outside").is_err());
+        assert!(cache_path(&root, "/tmp/outside").is_err());
+        assert!(cache_path(&root, ".").is_err());
+        assert_eq!(
+            cache_path(&root, "./rules/new.yaml").unwrap(),
+            root.join("rules/new.yaml")
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(std::env::temp_dir(), root.join("link")).unwrap();
+            assert!(cache_path(&root, "link/new.yaml").is_err());
+            assert!(cache_path(&root, "link").is_err());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_formats_preserve_metadata_and_reject_bad_payloads() {
+        let yaml: serde_yml::Mapping = serde_yml::from_str(
+            "rule-providers: {r: {url: 'http://localhost/rules', format: text, behavior: domain}}",
+        )
+        .unwrap();
+        let resource = &yaml.extract(&[ResourceSection::RuleProvider])[0];
+        assert_eq!(resource.format, "text");
+        assert_eq!(resource.behavior, "domain");
+        assert!(
+            resource
+                .validate(
+                    b"example.com\n+.example.org\n",
+                    std::path::Path::new("unused")
+                )
+                .is_ok()
+        );
+        assert!(
+            resource
+                .validate(&[0xff], std::path::Path::new("unused"))
+                .is_err()
+        );
+        let mut resource = resource.clone();
+        resource.format = "yaml".into();
+        assert!(
+            resource
+                .validate(b"unexpected: []", std::path::Path::new("unused"))
+                .is_err()
+        );
+        assert!(
+            resource
+                .validate(b"payload: []", std::path::Path::new("unused"))
+                .is_ok()
+        );
+    }
 
     fn load_test_yaml() -> serde_yml::Mapping {
         let path = concat!(
@@ -297,128 +435,5 @@ mod tests {
         );
         let resources = yaml.extract(&[ResourceSection::ProxyProvider]);
         assert!(resources.is_empty());
-    }
-
-    #[test]
-    fn extract_singbox_empty_json() {
-        let json: serde_json::Value = serde_json::json!({});
-        let resources = extract_singbox_net_resources(&json);
-        assert!(resources.is_empty());
-    }
-
-    #[test]
-    fn extract_singbox_outbounds_with_url() {
-        let json: serde_json::Value = serde_json::json!({
-            "outbounds": [
-                {
-                    "tag": "hk-node",
-                    "type": "vless",
-                    "outbound": {
-                        "url": "https://example.com/hk.json",
-                        "path": "./outbounds/hk.json"
-                    }
-                }
-            ]
-        });
-        let resources = extract_singbox_net_resources(&json);
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0].name, "hk-node");
-        assert_eq!(resources[0].url, "https://example.com/hk.json");
-        assert_eq!(resources[0].path, "./outbounds/hk.json");
-    }
-
-    #[test]
-    fn extract_singbox_rule_set_remote() {
-        let json: serde_json::Value = serde_json::json!({
-            "route": {
-                "rule_set": [
-                    {
-                        "type": "remote",
-                        "tag": "geoip-cn",
-                        "format": "binary",
-                        "url": "https://example.com/geoip.db",
-                        "path": "./rules/geoip.db"
-                    }
-                ]
-            }
-        });
-        let resources = extract_singbox_net_resources(&json);
-        assert_eq!(resources.len(), 1);
-        assert_eq!(resources[0].name, "geoip-cn");
-        assert_eq!(resources[0].section, ResourceSection::RuleProvider);
-    }
-
-    #[test]
-    fn extract_singbox_rule_set_local_ignored() {
-        let json: serde_json::Value = serde_json::json!({
-            "route": {
-                "rule_set": [
-                    {
-                        "type": "local",
-                        "tag": "my-rules",
-                        "path": "./rules/local.json"
-                    }
-                ]
-            }
-        });
-        let resources = extract_singbox_net_resources(&json);
-        assert!(resources.is_empty());
-    }
-
-    #[test]
-    fn extract_singbox_no_outbounds_no_route() {
-        let json: serde_json::Value = serde_json::json!({
-            "log": {"level": "info"}
-        });
-        let resources = extract_singbox_net_resources(&json);
-        assert!(resources.is_empty());
-    }
-
-    fn load_singbox_profile(name: &str) -> serde_json::Value {
-        let path = format!(
-            "{}/tests/profiles/sing-box/{}",
-            env!("CARGO_MANIFEST_DIR"),
-            name
-        );
-        let data = std::fs::read_to_string(path).unwrap();
-        serde_json::from_str(&data).unwrap()
-    }
-
-    #[test]
-    fn singbox_profile_minimal_has_no_resources() {
-        let json = load_singbox_profile("minimal.json");
-        let resources = extract_singbox_net_resources(&json);
-        assert!(resources.is_empty());
-    }
-
-    #[test]
-    fn singbox_profile_with_providers_finds_outbounds() {
-        let json = load_singbox_profile("with_providers.json");
-        let resources = extract_singbox_net_resources(&json);
-        assert_eq!(resources.len(), 4);
-        let pp_count = resources
-            .iter()
-            .filter(|r| r.section == ResourceSection::ProxyProvider)
-            .count();
-        assert_eq!(pp_count, 2);
-        let rp_count = resources
-            .iter()
-            .filter(|r| r.section == ResourceSection::RuleProvider)
-            .count();
-        assert_eq!(rp_count, 2);
-    }
-
-    #[test]
-    fn singbox_profile_full_finds_rulesets() {
-        let json = load_singbox_profile("full.json");
-        let resources = extract_singbox_net_resources(&json);
-        let rp: Vec<_> = resources
-            .iter()
-            .filter(|r| r.section == ResourceSection::RuleProvider)
-            .collect();
-        assert_eq!(rp.len(), 3);
-        assert!(rp.iter().any(|r| r.name == "geosite-geolocation-cn"));
-        assert!(rp.iter().any(|r| r.name == "geosite-geolocation-!cn"));
-        assert!(rp.iter().any(|r| r.name == "category-ads-all"));
     }
 }

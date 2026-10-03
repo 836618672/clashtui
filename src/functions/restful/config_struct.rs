@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-/// config loaded from clash core (mihomo or sing-box)
+/// Configuration returned by Mihomo.
 ///
-/// Fields present in both cores are always displayed if available.
+/// Available fields are displayed when returned by the API.
 /// Core-specific fields are Optional and only shown when the API returns them.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -9,7 +9,7 @@ pub struct ClashConfig {
     pub mode: Mode,
     #[serde(default)]
     pub tun: Option<TunConfig>,
-    // Common (both cores)
+    // General runtime settings
     pub log_level: Option<LogLevel>,
     pub bind_address: Option<String>,
     pub allow_lan: Option<bool>,
@@ -18,13 +18,13 @@ pub struct ClashConfig {
     pub global_client_fingerprint: Option<String>,
     pub tcp_concurrent: Option<bool>,
     pub global_ua: Option<String>,
-    pub dns: Option<String>,
+    pub dns: Option<serde_json::Value>,
     pub geodata_mode: Option<bool>,
     pub unified_delay: Option<bool>,
     pub geo_auto_update: Option<bool>,
     pub geo_update_interval: Option<u16>,
     pub find_process_mode: Option<String>,
-    // sing-box-specific
+    // Listener ports and available modes
     pub port: Option<u16>,
     pub socks_port: Option<u16>,
     pub redir_port: Option<u16>,
@@ -101,15 +101,33 @@ impl ClashConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, strum::VariantArray)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(from = "String", into = "String")]
 pub enum Mode {
-    #[serde(alias = "Rule")]
     Rule,
-    #[serde(alias = "Global")]
     Global,
-    #[serde(alias = "Direct")]
     Direct,
+    Custom(String),
+}
+impl From<String> for Mode {
+    fn from(value: String) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "rule" => Self::Rule,
+            "global" => Self::Global,
+            "direct" => Self::Direct,
+            _ => Self::Custom(value),
+        }
+    }
+}
+impl From<Mode> for String {
+    fn from(mode: Mode) -> Self {
+        match mode {
+            Mode::Rule => "rule".to_owned(),
+            Mode::Global => "global".to_owned(),
+            Mode::Direct => "direct".to_owned(),
+            Mode::Custom(value) => value,
+        }
+    }
 }
 impl std::fmt::Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -117,12 +135,13 @@ impl std::fmt::Display for Mode {
             Mode::Rule => "Rule",
             Mode::Global => "Global",
             Mode::Direct => "Direct",
+            Mode::Custom(value) => value.as_str(),
         };
         write!(f, "{}", x)
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, strum::VariantArray)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     Silent,
@@ -130,6 +149,10 @@ pub enum LogLevel {
     Warning,
     Info,
     Debug,
+    Trace,
+    Fatal,
+    #[serde(untagged)]
+    Custom(String),
 }
 
 impl std::fmt::Display for LogLevel {
@@ -140,6 +163,9 @@ impl std::fmt::Display for LogLevel {
             LogLevel::Warning => "warning",
             LogLevel::Info => "info",
             LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
+            LogLevel::Fatal => "fatal",
+            LogLevel::Custom(value) => value.as_str(),
         };
         write!(f, "{}", s)
     }
@@ -162,11 +188,11 @@ impl std::fmt::Display for TunConfig {
 
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, strum::VariantArray)]
 pub enum TunStack {
-    #[serde(alias = "Mixed")]
+    #[serde(alias = "mixed")]
     Mixed,
-    #[serde(alias = "gVisor")]
+    #[serde(alias = "gVisor", alias = "gvisor")]
     Gvisor,
-    #[serde(alias = "System")]
+    #[serde(alias = "system")]
     System,
 }
 impl std::fmt::Display for TunStack {
@@ -184,62 +210,12 @@ impl std::fmt::Display for TunStack {
 mod tests {
     use super::*;
 
-    fn load_singbox_config() -> ClashConfig {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/apidata/sing-box/configs.json"
-        );
-        let data = std::fs::read_to_string(path).unwrap();
-        serde_json::from_str(&data).unwrap()
-    }
-
     #[test]
-    fn singbox_config_mode_is_rule() {
-        let cfg = load_singbox_config();
-        assert!(matches!(cfg.mode, Mode::Rule));
-    }
-
-    #[test]
-    fn singbox_config_tun_is_null() {
-        let cfg = load_singbox_config();
-        assert!(cfg.tun.is_none());
-    }
-
-    #[test]
-    fn singbox_config_log_level_is_error() {
-        let cfg = load_singbox_config();
-        assert!(matches!(cfg.log_level, Some(LogLevel::Error)));
-    }
-
-    #[test]
-    fn singbox_config_ports_are_zero() {
-        let cfg = load_singbox_config();
-        assert_eq!(cfg.port, Some(0));
-        assert_eq!(cfg.mixed_port, Some(0));
-        assert_eq!(cfg.socks_port, Some(0));
-    }
-
-    #[test]
-    fn singbox_config_mode_list() {
-        let cfg = load_singbox_config();
-        let list = cfg.mode_list.expect("mode_list missing");
-        assert_eq!(list, vec!["Rule", "Proxy", "Direct"]);
-    }
-
-    #[test]
-    fn singbox_config_mihomo_fields_are_none() {
-        let cfg = load_singbox_config();
-        assert!(cfg.global_client_fingerprint.is_none());
-        assert!(cfg.tcp_concurrent.is_none());
-        assert!(cfg.global_ua.is_none());
-    }
-
-    #[test]
-    fn singbox_config_build_output() {
-        let cfg = load_singbox_config();
-        let lines = cfg.build();
-        assert!(lines.contains(&"mode:Rule".to_string()));
-        assert!(lines.contains(&"mode_list:Rule, Proxy, Direct".to_string()));
-        assert!(lines.contains(&"log_level:error".to_string()));
+    fn custom_modes_and_structured_dns_preserve_usable_configuration() {
+        let config: ClashConfig = serde_json::from_str(r#"{"mode":"Work","mode-list":["Work","Home"],"dns":{"enable":true},"log-level":"trace","tun":{"enable":false,"stack":"mixed"}}"#).unwrap();
+        assert_eq!(config.mode.to_string(), "Work");
+        assert_eq!(serde_json::to_string(&config.mode).unwrap(), "\"Work\"");
+        assert!(matches!(config.log_level, Some(LogLevel::Trace)));
+        assert!(config.dns.unwrap().is_object());
     }
 }

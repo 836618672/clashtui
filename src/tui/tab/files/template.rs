@@ -23,6 +23,16 @@ mod_agent!(
         ),
         ([KeyCode::Char('e')], Key::Action(Action::Edit), "Edit"),
         (
+            [KeyCode::Char('a')],
+            Key::Action(Action::New),
+            "New template"
+        ),
+        (
+            [KeyCode::Char('P')],
+            Key::Action(Action::PreviewGenerated),
+            "Preview generated configuration"
+        ),
+        (
             [KeyCode::Esc],
             Key::Action(Action::ClearFilter),
             "Clear filter"
@@ -131,6 +141,8 @@ impl<'de> serde::Deserialize<'de> for Key {
                         "ClearFilter" => Ok(Key::Action(Action::ClearFilter)),
                         "EditProviders" => Ok(Key::Action(Action::EditProviders)),
                         "Preview" => Ok(Key::Action(Action::Preview)),
+                        "PreviewGenerated" => Ok(Key::Action(Action::PreviewGenerated)),
+                        "New" => Ok(Key::Action(Action::New)),
                         "Search" => Ok(Key::Action(Action::Search)),
                         "FzfFind" => Ok(Key::Action(Action::FzfFind)),
                         "GoTop" => Ok(Key::Action(Action::GoTop)),
@@ -143,6 +155,8 @@ impl<'de> serde::Deserialize<'de> for Key {
                                 "Edit",
                                 "EditProviders",
                                 "Preview",
+                                "PreviewGenerated",
+                                "New",
                                 "Search",
                                 "FzfFind",
                                 "GoTop",
@@ -168,6 +182,8 @@ pub enum Action {
     ClearFilter,
     EditProviders,
     Preview,
+    PreviewGenerated,
+    New,
     Search,
     FzfFind,
     GoTop,
@@ -248,6 +264,10 @@ impl DualTabContentMate for Template {
             Key::Action(action) => {
                 log::debug!("Template::Action: {action:?}");
                 match action {
+                    Action::New => {
+                        action.act(String::new()).spawn_at(task_set);
+                        return false;
+                    }
                     Action::GoTop => state.select_first(),
                     Action::GoEnd => state.select_last(),
                     Action::FzfFind => {
@@ -355,6 +375,8 @@ mod actions {
                 Self::ClearFilter => do_nothing(),
                 Self::EditProviders => _edit_providers(name).await,
                 Self::Preview => preview(name).await,
+                Self::PreviewGenerated => preview_generated(name).await,
+                Self::New => new_template().await,
                 Self::Search => search().await,
                 Self::FzfFind => unreachable!("FzfFind handled directly"),
                 Self::GoTop | Self::GoEnd => do_nothing(),
@@ -366,13 +388,40 @@ mod actions {
     type C = (<Template as DualTabContentMate>::Mate, Template);
 
     async fn generate(name: String) -> CB {
-        let profile_name = format!("{name}.tpl");
-        let is_singbox = crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox;
-        if is_singbox {
-            tri!(apply_template_singbox(&name, &profile_name, false, false).await);
-        } else {
-            tri!(apply_template(&name, &profile_name));
+        let state = tri!(tri!(
+            crate::functions::restful::session::spawn_blocking(
+                crate::functions::management::snapshot
+            )
+            .await
+        ));
+        let profile_name = tri!(
+            Input::new()
+                .with_value(format!("{name}.tpl"))
+                .with_title("Generated profile name".to_owned())
+                .build_and_send()
+                .await,
+            or_cancel
+        );
+        let profile_name = profile_name.trim().to_owned();
+        if state["profiles"].as_array().is_some_and(|profiles| {
+            profiles
+                .iter()
+                .any(|profile| profile["name"] == profile_name)
+        }) && Confirm::title("Replace generated profile?".to_owned())
+            .with_prompt(format!(
+                "Replace {profile_name}? Enter confirms; Esc cancels."
+            ))
+            .build_and_send()
+            .await
+            .is_err()
+        {
+            return do_nothing();
         }
+        let result = crate::functions::restful::session::spawn_blocking(move || {
+            crate::functions::management::execute(serde_json::json!({"action":"generate","name":profile_name,"template":name,"revision":state["revision"],"core":state["core"]}))
+        })
+        .await;
+        tri!(tri!(result));
         sync!(C)
     }
 
@@ -384,15 +433,13 @@ mod actions {
             return do_nothing();
         }
 
-        let path = crate::functions::file::TEMPLATE_PATH.join(&name);
-        match std::fs::remove_file(&path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                Confirm::err(e);
-                return do_nothing();
-            }
-        }
+        let result = crate::functions::restful::session::spawn_blocking(move || -> anyhow::Result<()> {
+            let state = crate::functions::management::snapshot()?;
+            let document = crate::functions::management::read_document("template", &name)?;
+            crate::functions::management::execute(serde_json::json!({"action":"delete_template","name":name,"revision":state["revision"],"document_revision":document["revision"],"core":state["core"]}))?;
+            Ok(())
+        }).await;
+        tri!(tri!(result));
 
         let templates = tri!(get_all_templates());
         wrapper(move |(_, content): &mut C| {
@@ -401,7 +448,7 @@ mod actions {
     }
 
     async fn _edit(name: String) -> CB {
-        let path = crate::functions::file::TEMPLATE_PATH.join(&name);
+        let path = crate::functions::file::template_root().join(&name);
         log::debug!("template::_edit: path={}", path.display());
         tri!(edit(path.to_str().unwrap()));
         do_nothing()
@@ -413,12 +460,52 @@ mod actions {
     }
 
     async fn preview(name: String) -> CB {
-        let path = crate::functions::file::TEMPLATE_PATH.join(&name);
+        let path = crate::functions::file::template_root().join(&name);
         let content = tri!(std::fs::read_to_string(path));
         Confirm::title(format!("Preview: {name}"))
             .with_prompt(content)
             .build_and_send();
         do_nothing()
+    }
+
+    async fn preview_generated(name: String) -> CB {
+        let content = tri!(preview_template(&name, false).await);
+        Confirm::title(format!("Generated preview: {name}"))
+            .with_prompt(content)
+            .build_and_send();
+        do_nothing()
+    }
+
+    async fn new_template() -> CB {
+        let name = tri!(
+            Input::new()
+                .with_title("New Mihomo template filename (.yaml)".to_owned())
+                .build_and_send()
+                .await,
+            or_cancel
+        );
+        let name = name.trim().to_owned();
+        tri!(crate::functions::file::profile::validate_profile_name(
+            &name
+        ));
+        let path = crate::functions::file::template_root().join(&name);
+        if path.exists() {
+            Confirm::err("Template already exists");
+            return do_nothing();
+        }
+        let new_name = name.clone();
+        let result = crate::functions::restful::session::spawn_blocking(move || {
+            crate::functions::management::save_document(
+                "template",
+                &new_name,
+                "{}",
+                &crate::functions::management::revision(b""),
+            )
+        })
+        .await;
+        tri!(tri!(result));
+        tri!(edit(path.to_str().unwrap()));
+        sync!(C)
     }
 
     async fn search() -> CB {
@@ -438,7 +525,7 @@ mod actions {
 
     pub(super) async fn fzf_find(items: Vec<String>) -> CB {
         let fzf_items = items.clone();
-        let selected = tokio::task::spawn_blocking(move || {
+        let selected = crate::functions::restful::session::spawn_blocking(move || {
             crate::tui::widget::fzffind::run_fzf(&fzf_items, "Find Template")
         })
         .await

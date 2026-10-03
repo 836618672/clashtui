@@ -7,7 +7,6 @@ setup() {
   CORE_TYPE="all"
   IS_USER=false
   MIHOMO_UPSTREAM="MetaCubeX/mihomo"
-  SINGBOX_UPSTREAM="SagerNet/sing-box"
 
   # Create a temp dir simulating the project root (for local contrib discovery)
   PROJECT_DIR="$BATS_TEST_TMPDIR/project"

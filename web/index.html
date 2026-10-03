@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ClashTui · MetaCubeXD 本地管理</title>
+<style>
+:root{color-scheme:light dark;font-family:system-ui}body{max-width:1100px;margin:2rem auto;padding:0 1rem}header,nav,.actions{display:flex;gap:.6rem;flex-wrap:wrap;align-items:center}button,input,select,textarea{font:inherit;padding:.55rem;border:1px solid #8888;border-radius:6px}button{cursor:pointer}textarea{box-sizing:border-box;width:100%;height:52vh;font-family:monospace}table{width:100%;border-collapse:collapse}td,th{padding:.7rem;text-align:left;border-bottom:1px solid #8884}#notice{white-space:pre-wrap;padding:.7rem;color:#ca6520}section{margin:1.5rem 0}a{color:#388ee8}small{opacity:.7}
+</style>
+<header><h1>ClashTui 本地管理</h1><span>MetaCubeXD 目标版本 v1.273.1</span></header>
+<p>订阅、模板与覆盖配置和终端共用；核心节点、连接、规则、图表及日志通过 MetaCubeXD 管理。</p>
+<nav><input id="token" type="password" autocomplete="off" placeholder="独立管理令牌"><button id="connect">连接 / 刷新</button><a id="panel" target="_blank" rel="noopener noreferrer" hidden>打开 MetaCubeXD</a><button id="preparePanel">部署锁定版本面板</button></nav>
+<div id="notice" role="status" aria-live="polite"></div>
+<main hidden id="main">
+<p id="status"></p>
+<div class="actions"><button data-service="start">启动服务</button><button data-service="restart">重启服务</button><button data-service="stop">停止服务</button><button data-service="system_proxy" id="systemProxy" hidden>切换系统代理</button><button data-service="install" id="installService" hidden>安装服务</button><button data-service="uninstall" id="uninstallService" hidden>卸载服务</button><button id="override">编辑覆盖配置</button></div>
+<section><h2>订阅与配置</h2><div class="actions"><input id="name" placeholder="配置名称"><input id="url" type="url" placeholder="订阅 HTTPS URL"><button id="create">添加订阅</button><input id="importFile" type="file" accept=".yaml,.yml,.json" aria-label="本地配置"><button id="import">导入文件</button><button id="updateAll">更新全部配置</button><input id="profileFilter" placeholder="筛选配置名称" aria-label="筛选配置"></div><table><thead><tr><th>名称</th><th>类型</th><th>操作</th></tr></thead><tbody id="profiles"></tbody></table></section>
+<section><h2>模板</h2><select id="templates" aria-label="模板"></select><input id="generated" placeholder="生成的配置名称"><button id="generate">生成配置</button><button id="previewTemplate">生成预览</button><button id="editTemplate">编辑模板</button><button id="templateProviders">编辑 Provider</button><button id="deleteTemplate">删除模板</button><button id="newTemplate">新建模板</button></section>
+<section><h2>运行设置</h2><button id="runtime">编辑临时设置</button><button id="persist">保存运行设置为覆盖配置</button><p>临时修改作用于当前核心；保存后将在下次配置激活时生效。</p></section>
+<section id="editor" hidden><h2 id="editTitle"></h2><small>保存前校验格式。激活配置时再调用核心校验。保存覆盖配置不会立即改变运行设置。</small><textarea id="content" spellcheck="false" aria-label="配置内容"></textarea><div class="actions"><button id="save">保存</button><button id="download">导出</button><button id="cancel">关闭</button></div></section>
+<section id="result" hidden><h2 id="resultTitle">操作结果</h2><textarea id="resultContent" readonly aria-label="操作结果"></textarea><button id="closeResult">关闭结果</button></section>
+</main>
+<script>
+'use strict';
+let state,documentState,busy=false,polling=false,refreshEpoch=0,profilesKey,templatesKey;
+const $=id=>document.getElementById(id);
+function notice(message){$('notice').textContent=message;}
+function showResult(title,result){$('resultTitle').textContent=title;$('resultContent').value=typeof result==='string'?result:JSON.stringify(result,null,2);$('result').hidden=false;}
+async function api(path,value){if(value&&state&&!value.core)value.core=state.core;const response=await fetch(path,{method:value?'POST':'GET',headers:{Authorization:'Bearer '+$('token').value,...(value?{'Content-Type':'application/json'}:{})},body:value?JSON.stringify(value):undefined});const result=await response.json();if(!response.ok)throw new Error(result.error||'HTTP '+response.status);if(result.job){notice('操作正在执行，请稍候…');for(;;){await new Promise(resolve=>setTimeout(resolve,500));const job=await api('/api/job');if(job.id!==result.job)throw new Error('任务结果已被另一客户端替换，请刷新后核对状态');if(!job.pending){if(!job.result?.ok)throw new Error(job.result?.error||'任务执行失败');return job.result.value;}}}return result;}
+async function run(work,silent=false){if(busy)return;busy=true;refreshEpoch++;document.querySelectorAll('button').forEach(b=>b.disabled=true);try{await work();if(!silent)notice('操作完成');}catch(error){notice(error.message);}finally{busy=false;document.querySelectorAll('button').forEach(b=>b.disabled=false);}}
+async function refresh(){state=await api('/api/state');render();}
+function render(){ $('main').hidden=false;$('status').textContent=`核心：${state.core} · 当前配置：${state.current} · 服务：${state.service_running===null?'未知':state.service_running?'运行中':'已停止'} · 面板：${state.panel_deployment?.verified_install_record?'已记录锁定版本部署':'实际版本未知'}`;
+$('systemProxy').hidden=state.system_proxy===null;$('systemProxy').textContent=state.system_proxy?'关闭系统代理':'开启系统代理';$('installService').hidden=$('uninstallService').hidden=!state.service_install;
+const endpoint=new URL(state.panel);if(['http:','https:'].includes(endpoint.protocol)){$('panel').href=endpoint.href;$('panel').hidden=false;}
+const nextProfilesKey=JSON.stringify([state.core,$('profileFilter').value,state.profiles.map(pf=>[pf.name,pf.type,pf.url,pf.no_pp,pf.update_with_proxy])]);if(nextProfilesKey!==profilesKey){profilesKey=nextProfilesKey;$('profiles').replaceChildren();for(const pf of state.profiles){if(!$('profileFilter').value||pf.name.toLowerCase().includes($('profileFilter').value.toLowerCase())){const row=document.createElement('tr');for(const text of [pf.name,typeof pf.type==='string'?pf.type:JSON.stringify(pf.type)]){const cell=document.createElement('td');cell.textContent=text;row.append(cell);}const cell=document.createElement('td');for(const [label,action] of [['编辑文件','edit'],['预览','preview'],['校验','check'],['测试','test'],['流量额度','traffic'],['更新','update'],['激活','activate'],['编辑名称/URL','rename'],['复制 URL','profile_url'],['删除','delete'],['内联 Provider','no_pp'],['代理更新','with_proxy']]){if(action==='profile_url'&&!pf.url||action==='no_pp'&&state.core!=='mihomo')continue;const b=document.createElement('button');b.disabled=busy;b.textContent=label+(action==='no_pp'?(pf.no_pp?' ✓':''):action==='with_proxy'?(pf.update_with_proxy?' ✓':''):'');b.onclick=()=>run(async()=>{if(action==='edit'){await edit('profile',pf.name);return;}if(['delete','activate'].includes(action)&&!confirm(`${label}配置 ${pf.name}？`))return;const extra={};if(action==='rename'){const newName=prompt('新名称',pf.name);if(!newName)return;extra.new_name=newName;if(pf.url){const url=prompt('订阅 URL（保存后需更新下载）',pf.url);if(url===null)return;extra.url=url;}}const result=await act(action,{name:pf.name,...extra});if(['preview','check','test','traffic','profile_url','update'].includes(action)){showResult(label,result.content??result.url??result);if(result.valid===false)throw new Error('配置校验失败，请查看核心诊断输出');if(result.partial_failure)throw new Error('部分订阅资源更新失败，请查看结果');if(action==='profile_url'){try{await navigator.clipboard.writeText(result.url);}catch{showResult('请手动复制 URL',result.url);}}}});cell.append(b);}row.append(cell);$('profiles').append(row);}}}
+const nextTemplatesKey=JSON.stringify(state.templates);if(nextTemplatesKey!==templatesKey){templatesKey=nextTemplatesKey;const previous=$('templates').value;$('templates').replaceChildren();for(const name of state.templates){const option=document.createElement('option');option.value=option.textContent=name;$('templates').append(option);}if(state.templates.includes(previous))$('templates').value=previous;}}
+async function act(action,extra={}){const result=await api('/api/action',{action,revision:state.revision,...extra});await refresh();return result;}
+async function edit(kind,name){const result=await api('/api/action',{action:'read',kind,name});documentState={kind,name,revision:result.revision,core:state.core};$('content').value=result.content;$('editTitle').textContent=`编辑 ${kind}: ${name}`;$('editor').hidden=false;$('editor').scrollIntoView({behavior:'smooth'});}
+$('connect').onclick=()=>run(refresh);
+$('profileFilter').oninput=()=>{if(state)render();};
+$('closeResult').onclick=()=>{$('result').hidden=true;};
+$('updateAll').onclick=()=>run(async()=>{if(confirm(`更新全部 ${state.profiles.length} 个配置？当前使用的配置可能随更新重新激活。`)){const result=await act('update_all');showResult('批量更新结果',result);if(result.results.some(item=>!item.ok))throw new Error('部分配置更新失败，请查看逐项结果');}});
+$('preparePanel').onclick=()=>run(async()=>{if(confirm('下载并部署 MetaCubeXD v1.273.1？归档将验证 SHA-256；完成后替换核心面板目录。')){await api('/api/action',{action:'prepare_panel'});await refresh();}});
+$('create').onclick=()=>run(()=>act('create',{name:$('name').value,url:$('url').value}));
+$('import').onclick=()=>run(async()=>{const file=$('importFile').files[0];if(!file)throw new Error('请选择配置文件');await act('import',{name:$('name').value,content:await file.text()});});
+document.querySelectorAll('[data-service]').forEach(b=>b.onclick=()=>run(async()=>{if(confirm(`确认${b.textContent}？`))await act(b.dataset.service);}));
+$('override').onclick=()=>run(()=>edit('override',''));
+$('editTemplate').onclick=()=>run(()=>edit('template',$('templates').value));
+$('previewTemplate').onclick=()=>run(async()=>showResult('模板生成预览（不注册配置）',(await act('preview_template',{name:$('templates').value})).content));
+$('deleteTemplate').onclick=()=>run(async()=>{const name=$('templates').value;if(!confirm(`删除模板 ${name}？`))return;const document=await api('/api/action',{action:'read',kind:'template',name});await act('delete_template',{name,document_revision:document.revision});});
+$('templateProviders').onclick=()=>run(async()=>{const name=$('templates').value;const result=await act('template_providers',{name});const groups=prompt('Provider 分组（JSON 对象：分组 → 名称 → URL）',JSON.stringify(result.groups,null,2));if(groups!==null)await act('save_template_providers',{name,groups:JSON.parse(groups),document_revision:result.revision});});
+$('newTemplate').onclick=()=>run(async()=>{const name=prompt('Mihomo 模板文件名（建议 .yaml）');if(name)await edit('template',name);});
+$('generate').onclick=()=>run(async()=>{const name=$('generated').value;if(state.profiles.some(pf=>pf.name===name)&&!confirm(`重新生成并替换配置 ${name} 的文件？`))return;await act('generate',{name,template:$('templates').value});});
+$('runtime').onclick=()=>run(async()=>{const current=await api('/api/action',{action:'runtime'});const patch=prompt('输入需要修改的字段（JSON）；当前值：'+JSON.stringify(current),'{}');if(patch!==null){await api('/api/action',{action:'patch',patch:JSON.parse(patch)});await refresh();}});
+$('persist').onclick=()=>run(async()=>{if(confirm('将核心当前运行设置保存为覆盖配置？')){await api('/api/action',{action:'persist'});await refresh();}});
+$('save').onclick=()=>run(async()=>{const result=await api('/api/action',{action:'save',...documentState,content:$('content').value});documentState.revision=result.revision;await refresh();});
+$('cancel').onclick=()=>{$('editor').hidden=true;documentState=null;};
+$('download').onclick=()=>{const url=URL.createObjectURL(new Blob([$('content').value],{type:'text/plain'}));const a=document.createElement('a');a.href=url;a.download=documentState.name||'core_override_config';a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+async function poll(){if(!state||busy||polling||document.hidden)return;polling=true;const epoch=refreshEpoch;try{const next=await api('/api/state');if(!busy&&epoch===refreshEpoch){state=next;render();}}catch(error){if(!busy&&epoch===refreshEpoch)notice(error.message);}finally{polling=false;}}
+setInterval(poll,2000);
+</script></html>

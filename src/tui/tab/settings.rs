@@ -18,6 +18,21 @@ mod_agent!(
         ([KeyCode::Down], SettingsKey::MoveDown, "Move down"),
         ([KeyCode::Char('k')], SettingsKey::MoveUp, "Move up"),
         ([KeyCode::Char('j')], SettingsKey::MoveDown, "Move down"),
+        (
+            [KeyCode::Char('c')],
+            SettingsKey::CloseOnMode,
+            "Toggle closing connections after mode change"
+        ),
+        (
+            [KeyCode::Char('e')],
+            SettingsKey::EditRuntime,
+            "Edit temporary runtime fields"
+        ),
+        (
+            [KeyCode::Char('p')],
+            SettingsKey::PersistRuntime,
+            "Save current runtime fields to override"
+        ),
     ]
 );
 
@@ -27,6 +42,9 @@ pub(crate) enum SettingsKey {
     MoveUp,
     MoveDown,
     Esc,
+    EditRuntime,
+    PersistRuntime,
+    CloseOnMode,
 }
 
 impl TryFrom<&crate::tui::Key> for SettingsKey {
@@ -48,7 +66,7 @@ impl TryFrom<&crate::tui::Key> for SettingsKey {
 }
 
 use crate::config::CoreType;
-use crate::functions::restful::config_struct::{Mode, TunStack};
+use crate::functions::restful::config_struct::TunStack;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsOp {
@@ -62,9 +80,9 @@ enum SettingsOp {
 }
 
 impl SettingsOp {
-    fn all() -> Vec<Self> {
+    fn all(core_type: CoreType) -> Vec<Self> {
         let mut ops = vec![Self::SwitchMode, Self::AllowLan];
-        if CONFIG.core_type() == CoreType::Mihomo {
+        if core_type == CoreType::Mihomo {
             ops.push(Self::TunEnable);
             ops.push(Self::TunStackOp);
             ops.push(Self::FlushFakeIP);
@@ -77,6 +95,7 @@ impl SettingsOp {
 
 #[derive(Default)]
 struct SettingsContent {
+    core_type: CoreType,
     ops: Vec<SettingsOp>,
     current_mode: String,
     allow_lan: bool,
@@ -86,8 +105,65 @@ struct SettingsContent {
     mode_selector_visible: bool,
     tun_selector_state: ListState,
     tun_selector_visible: bool,
-    modes: Vec<Mode>,
+    modes: Vec<String>,
     tun_stacks: Vec<TunStack>,
+    paused: bool,
+    refresh_in_flight: std::cell::Cell<bool>,
+    error: Option<String>,
+    close_on_mode: bool,
+}
+
+impl SettingsContent {
+    fn apply_config(&mut self, config: crate::functions::restful::config_struct::ClashConfig) {
+        self.current_mode = config.mode.to_string();
+        self.modes = config
+            .mode_list
+            .clone()
+            .filter(|modes| !modes.is_empty())
+            .unwrap_or_else(|| vec!["Rule".to_owned(), "Global".to_owned(), "Direct".to_owned()]);
+        if !self.modes.contains(&self.current_mode) {
+            self.modes.push(self.current_mode.clone());
+        }
+        self.allow_lan = config.allow_lan.unwrap_or(false);
+        self.tun_enable = config.tun.as_ref().map(|tun| tun.enable).unwrap_or(false);
+        self.tun_stack = config
+            .tun
+            .as_ref()
+            .map(|tun| tun.stack.to_string())
+            .unwrap_or_default();
+        self.ops = SettingsOp::all(self.core_type);
+        // Missing optional fields are not evidence of a disabled setting.
+        self.ops.retain(|op| match op {
+            SettingsOp::AllowLan => {
+                self.core_type == CoreType::Mihomo && config.allow_lan.is_some()
+            }
+            SettingsOp::TunEnable | SettingsOp::TunStackOp => config.tun.is_some(),
+            _ => true,
+        });
+        self.error = None;
+    }
+
+    fn refresh(&self, task_set: &mut FutureSet<Self>, delay: std::time::Duration) {
+        if self.paused || self.refresh_in_flight.replace(true) {
+            return;
+        }
+        async move {
+            tokio::time::sleep(delay).await;
+            let result = crate::functions::restful::session::spawn_blocking(
+                crate::functions::restful::config::fetch,
+            )
+            .await
+            .unwrap();
+            wrapper(move |content: &mut Self| {
+                content.refresh_in_flight.set(false);
+                match result {
+                    Ok(config) => content.apply_config(config),
+                    Err(error) => content.error = Some(format!("State may be stale: {error}")),
+                }
+            })
+        }
+        .spawn_at(task_set);
+    }
 }
 
 impl BasicTabContent for SettingsContent {
@@ -101,62 +177,34 @@ impl BasicTabContent for SettingsContent {
         agent::all_shortcuts()
     }
 
-    fn on_enter(&mut self, _task_set: &mut FutureSet<Self>, _state: &mut Self::State) {
-        if crate::config::is_core_mismatch() {
-            self.current_mode = "core mismatch".to_owned();
-            self.allow_lan = false;
-            self.tun_enable = false;
-            self.tun_stack = "core mismatch".to_owned();
-        }
+    fn on_enter(&mut self, task_set: &mut FutureSet<Self>, _state: &mut Self::State) {
+        self.paused = false;
+        self.refresh(task_set, std::time::Duration::ZERO);
+    }
+
+    fn on_leave(&mut self, _task_set: &mut FutureSet<Self>, _state: &mut Self::State) {
+        self.paused = true;
+    }
+
+    fn after_sync(&self, task_set: &mut FutureSet<Self>) {
+        let interval = if self.error.is_some() { 5 } else { 2 };
+        self.refresh(task_set, std::time::Duration::from_secs(interval));
     }
 }
 
 impl TabContent for SettingsContent {
-    fn init(&mut self, task_set: &mut FutureSet<Self>, state: &mut Self::State) {
-        self.ops = SettingsOp::all();
-        self.modes = Mode::VARIANTS.to_vec();
+    fn init(&mut self, _task_set: &mut FutureSet<Self>, state: &mut Self::State) {
+        self.core_type = CONFIG.core_type();
+        self.paused = true;
+        self.current_mode = "Loading...".to_owned();
+        self.ops = vec![SettingsOp::SwitchMode];
+        self.modes = vec!["Rule".to_owned(), "Global".to_owned(), "Direct".to_owned()];
         self.tun_stacks = TunStack::VARIANTS.to_vec();
         self.mode_selector_state.select(Some(0));
         self.tun_selector_state.select(Some(0));
         if !self.ops.is_empty() {
             state.select(Some(0));
         }
-        if crate::config::is_core_mismatch() {
-            self.current_mode = "core mismatch".to_owned();
-            self.allow_lan = false;
-            self.tun_enable = false;
-            self.tun_stack = "core mismatch".to_owned();
-            return;
-        }
-
-        async move {
-            let result = tokio::task::spawn_blocking(crate::functions::restful::config::fetch)
-                .await
-                .unwrap();
-            match result {
-                Ok(config) => {
-                    let mode = config.mode.to_string();
-                    let allow_lan = config.allow_lan.unwrap_or(false);
-                    let tun_enable = config.tun.as_ref().map(|t| t.enable).unwrap_or(false);
-                    let tun_stack = config
-                        .tun
-                        .as_ref()
-                        .map(|t| t.stack.to_string())
-                        .unwrap_or_else(|| "Mixed".to_owned());
-                    wrapper(move |c: &mut SettingsContent| {
-                        c.current_mode = mode;
-                        c.allow_lan = allow_lan;
-                        c.tun_enable = tun_enable;
-                        c.tun_stack = tun_stack;
-                    })
-                }
-                Err(e) => {
-                    crate::tui::widget::popmsg::Confirm::err(e);
-                    do_nothing()
-                }
-            }
-        }
-        .spawn_at(task_set);
     }
 
     fn handle_key_event(
@@ -165,6 +213,36 @@ impl TabContent for SettingsContent {
         task_set: &mut FutureSet<Self>,
         state: &mut Self::State,
     ) {
+        if matches!(key, SettingsKey::CloseOnMode) {
+            self.close_on_mode = !self.close_on_mode;
+            return;
+        }
+        if matches!(key, SettingsKey::EditRuntime | SettingsKey::PersistRuntime) {
+            async move {
+                let result = if matches!(key, SettingsKey::PersistRuntime) {
+                    if crate::tui::widget::popmsg::Confirm::title("Save current settings to the override configuration?".to_owned())
+                        .with_prompt("Future profile activation will use these settings. Enter confirms; Esc cancels.".to_owned())
+                        .build_and_send().await.is_err() { return do_nothing(); }
+                    crate::functions::restful::session::spawn_blocking(crate::functions::management::persist_runtime).await
+                } else {
+                    let fields = crate::functions::restful::session::spawn_blocking(crate::functions::restful::config::fetch_raw).await;
+                    let fields = match fields { Ok(Ok(fields)) => fields, _ => { crate::tui::widget::popmsg::Confirm::err("Cannot read runtime configuration"); return do_nothing(); } };
+                    let available = crate::functions::restful::config::writable_fields(&fields, CONFIG.core_type());
+                    let Ok(patch) = Input::new().with_value("{}".to_owned())
+                        .with_title("Temporary runtime patch (JSON)".to_owned())
+                        .with_prompt(format!("Fields: {}. Example: {{\"log-level\":\"debug\"}}", available.join(", ")))
+                        .build_and_send().await else { return do_nothing(); };
+                    crate::functions::restful::session::spawn_blocking(move || {
+                        let patch = serde_json::from_str(&patch)?;
+                        crate::functions::restful::config::patch_checked(patch)?;
+                        Ok(serde_json::Value::Null)
+                    }).await
+                };
+                match result { Ok(Ok(_)) => {}, Ok(Err(error)) => crate::tui::widget::popmsg::Confirm::err(error), Err(error) => crate::tui::widget::popmsg::Confirm::err(error) }
+                do_nothing()
+            }.spawn_at(task_set);
+            return;
+        }
         if self.mode_selector_visible {
             match key {
                 SettingsKey::MoveUp => {
@@ -180,27 +258,30 @@ impl TabContent for SettingsContent {
                 SettingsKey::Esc => {
                     self.mode_selector_visible = false;
                 }
+                SettingsKey::EditRuntime
+                | SettingsKey::PersistRuntime
+                | SettingsKey::CloseOnMode => {}
                 SettingsKey::Execute => {
                     let idx = self.mode_selector_state.selected().unwrap_or(0);
                     if let Some(mode) = self.modes.get(idx) {
-                        let mode = *mode;
+                        let mode = mode.clone();
+                        let close = self.close_on_mode;
                         self.mode_selector_visible = false;
                         async move {
                             if crate::config::is_core_mismatch() {
                                 return do_nothing();
                             }
-                            let payload = serde_json::json!({"mode": mode.to_string()}).to_string();
-                            let result = tokio::task::spawn_blocking(move || {
-                                crate::functions::restful::config::patch(payload)
-                            })
-                            .await
-                            .unwrap();
+                            let payload = serde_json::json!({"mode": crate::functions::restful::config_struct::Mode::from(mode)}).to_string();
+                            let result =
+                                crate::functions::restful::session::spawn_blocking(move || {
+                                    crate::functions::restful::config::patch_and_fetch(payload)
+                                })
+                                .await
+                                .unwrap();
                             match result {
-                                Ok(_) => {
-                                    let new_val = mode.to_string();
-                                    wrapper(move |c: &mut SettingsContent| {
-                                        c.current_mode = new_val;
-                                    })
+                                Ok(config) => {
+                                    if close && let Err(error) = crate::functions::restful::session::spawn_blocking(crate::functions::restful::connection::terminate_all_connections).await.unwrap() { crate::tui::widget::popmsg::Confirm::err(format!("Mode changed, but closing connections failed: {error}")); }
+                                    wrapper(move |c: &mut SettingsContent| c.apply_config(config))
                                 }
                                 Err(e) => {
                                     crate::tui::widget::popmsg::Confirm::err(e);
@@ -230,6 +311,9 @@ impl TabContent for SettingsContent {
                 SettingsKey::Esc => {
                     self.tun_selector_visible = false;
                 }
+                SettingsKey::EditRuntime
+                | SettingsKey::PersistRuntime
+                | SettingsKey::CloseOnMode => {}
                 SettingsKey::Execute => {
                     let idx = self.tun_selector_state.selected().unwrap_or(0);
                     if let Some(stack) = self.tun_stacks.get(idx) {
@@ -241,17 +325,15 @@ impl TabContent for SettingsContent {
                             }
                             let payload = serde_json::json!({"tun": {"stack": stack.to_string()}})
                                 .to_string();
-                            let result = tokio::task::spawn_blocking(move || {
-                                crate::functions::restful::config::patch(payload)
-                            })
-                            .await
-                            .unwrap();
+                            let result =
+                                crate::functions::restful::session::spawn_blocking(move || {
+                                    crate::functions::restful::config::patch_and_fetch(payload)
+                                })
+                                .await
+                                .unwrap();
                             match result {
-                                Ok(_) => {
-                                    let new_val = stack.to_string();
-                                    wrapper(move |c: &mut SettingsContent| {
-                                        c.tun_stack = new_val;
-                                    })
+                                Ok(config) => {
+                                    wrapper(move |c: &mut SettingsContent| c.apply_config(config))
                                 }
                                 Err(e) => {
                                     crate::tui::widget::popmsg::Confirm::err(e);
@@ -267,6 +349,7 @@ impl TabContent for SettingsContent {
         }
 
         match key {
+            SettingsKey::EditRuntime | SettingsKey::PersistRuntime | SettingsKey::CloseOnMode => {}
             SettingsKey::MoveUp => {
                 let i = state.selected().unwrap_or(0);
                 state.select(Some(i.saturating_sub(1)));
@@ -286,25 +369,27 @@ impl TabContent for SettingsContent {
                     }
                     SettingsOp::AllowLan => {
                         let new_val = !self.allow_lan;
-                        self.allow_lan = new_val;
                         async move {
                             if crate::config::is_core_mismatch() {
                                 return do_nothing();
                             }
                             let payload = serde_json::json!({"allow-lan": new_val}).to_string();
-                            let result = tokio::task::spawn_blocking(move || {
-                                crate::functions::restful::config::patch(payload)
-                            })
-                            .await
-                            .unwrap();
+                            let result =
+                                crate::functions::restful::session::spawn_blocking(move || {
+                                    crate::functions::restful::config::patch_and_fetch(payload)
+                                })
+                                .await
+                                .unwrap();
                             match result {
-                                Ok(_) => wrapper(move |c: &mut SettingsContent| {
-                                    c.allow_lan = new_val;
-                                }),
+                                Ok(config) => {
+                                    wrapper(move |c: &mut SettingsContent| c.apply_config(config))
+                                }
                                 Err(e) => {
                                     crate::tui::widget::popmsg::Confirm::err(e);
                                     wrapper(move |c: &mut SettingsContent| {
-                                        c.allow_lan = !new_val;
+                                        c.error = Some(
+                                            "Setting was not confirmed; refreshing".to_owned(),
+                                        );
                                     })
                                 }
                             }
@@ -313,26 +398,28 @@ impl TabContent for SettingsContent {
                     }
                     SettingsOp::TunEnable => {
                         let new_val = !self.tun_enable;
-                        self.tun_enable = new_val;
                         async move {
                             if crate::config::is_core_mismatch() {
                                 return do_nothing();
                             }
                             let payload =
                                 serde_json::json!({"tun": {"enable": new_val}}).to_string();
-                            let result = tokio::task::spawn_blocking(move || {
-                                crate::functions::restful::config::patch(payload)
-                            })
-                            .await
-                            .unwrap();
+                            let result =
+                                crate::functions::restful::session::spawn_blocking(move || {
+                                    crate::functions::restful::config::patch_and_fetch(payload)
+                                })
+                                .await
+                                .unwrap();
                             match result {
-                                Ok(_) => wrapper(move |c: &mut SettingsContent| {
-                                    c.tun_enable = new_val;
-                                }),
+                                Ok(config) => {
+                                    wrapper(move |c: &mut SettingsContent| c.apply_config(config))
+                                }
                                 Err(e) => {
                                     crate::tui::widget::popmsg::Confirm::err(e);
                                     wrapper(move |c: &mut SettingsContent| {
-                                        c.tun_enable = !new_val;
+                                        c.error = Some(
+                                            "Setting was not confirmed; refreshing".to_owned(),
+                                        );
                                     })
                                 }
                             }
@@ -347,7 +434,7 @@ impl TabContent for SettingsContent {
                             if crate::config::is_core_mismatch() {
                                 return do_nothing();
                             }
-                            let result = tokio::task::spawn_blocking(|| {
+                            let result = crate::functions::restful::session::spawn_blocking(|| {
                                 crate::functions::restful::cache::flush_fakeip()
                             })
                             .await
@@ -367,7 +454,7 @@ impl TabContent for SettingsContent {
                             if crate::config::is_core_mismatch() {
                                 return do_nothing();
                             }
-                            let result = tokio::task::spawn_blocking(|| {
+                            let result = crate::functions::restful::session::spawn_blocking(|| {
                                 crate::functions::restful::cache::flush_dns()
                             })
                             .await
@@ -387,7 +474,7 @@ impl TabContent for SettingsContent {
                             if crate::config::is_core_mismatch() {
                                 return do_nothing();
                             }
-                            let result = tokio::task::spawn_blocking(|| {
+                            let result = crate::functions::restful::session::spawn_blocking(|| {
                                 crate::functions::restful::geo::upgrade_geo()
                             })
                             .await
@@ -409,9 +496,18 @@ impl TabContent for SettingsContent {
     }
 
     fn render(&self, f: &mut Frame, area: Rect, state: &mut Self::State) {
+        let title = self
+            .error
+            .as_ref()
+            .map(|error| format!("Settings — {error}"))
+            .unwrap_or_else(|| Self::TITLE.to_owned());
         let block = Block::bordered()
             .border_style(Theme::get().section("settings").border)
-            .title(Self::TITLE);
+            .title(title)
+            .title_bottom(format!(
+                "temporary by default · e edits · p persists · c close on mode: {}",
+                if self.close_on_mode { "yes" } else { "no" }
+            ));
 
         if crate::config::is_core_mismatch() {
             let widget = Paragraph::new("API data mismatch with configured core").block(block);
@@ -516,6 +612,30 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 mod tests {
     use super::*;
 
+    #[test]
+    fn external_settings_refresh_replaces_previous_values() {
+        let mut content = SettingsContent::default();
+        content.apply_config(serde_json::from_str(r#"{"mode":"rule","allow-lan":false}"#).unwrap());
+        assert_eq!(content.current_mode, "Rule");
+        assert!(!content.allow_lan);
+        content.error = Some("disconnected".to_owned());
+        content
+            .apply_config(serde_json::from_str(r#"{"mode":"global","allow-lan":true}"#).unwrap());
+        assert_eq!(content.current_mode, "Global");
+        assert!(content.allow_lan);
+        assert!(content.error.is_none());
+    }
+
+    #[test]
+    fn absent_fields_do_not_offer_lan_or_tun_mutations() {
+        let mut content = SettingsContent::default();
+        content.apply_config(serde_json::from_str(r#"{"mode":"rule"}"#).unwrap());
+        assert!(!content.ops.contains(&SettingsOp::AllowLan));
+        assert!(!content.ops.contains(&SettingsOp::TunEnable));
+        assert!(!content.ops.contains(&SettingsOp::TunStackOp));
+        assert!(content.ops.contains(&SettingsOp::SwitchMode));
+    }
+
     fn mk_key(code: KeyCode) -> crate::tui::Key {
         crate::tui::Key {
             code,
@@ -573,7 +693,7 @@ mod tests {
 
     #[test]
     fn settings_op_all_is_non_empty() {
-        let ops = SettingsOp::all();
+        let ops = SettingsOp::all(CoreType::Mihomo);
         assert!(!ops.is_empty());
         assert!(ops.contains(&SettingsOp::SwitchMode));
         assert!(ops.contains(&SettingsOp::AllowLan));

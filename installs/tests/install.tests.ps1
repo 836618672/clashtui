@@ -24,6 +24,16 @@ Describe "Get-Architecture" {
     }
 }
 
+Describe "Mihomo-only installer" {
+    It "Defaults to Mihomo" {
+        $Core | Should -Be "mihomo"
+    }
+
+    It "Rejects removed core choices before Main can run" {
+        { & $installScript -Core all } | Should -Throw
+    }
+}
+
 Describe "Get-OS" {
     It "Returns a known OS string" {
         $result = Get-OS
@@ -56,14 +66,12 @@ Describe "Resolve-Paths" {
 
     It "Sets subdirectory paths" {
         $script:INSTALL_DIR_MIHOMO | Should -Not -BeNullOrEmpty
-        $script:INSTALL_DIR_SINGBOX | Should -Not -BeNullOrEmpty
         $script:INSTALL_BIN | Should -Not -BeNullOrEmpty
     }
 
     It "Sets config directory paths" {
         $script:CLASHTUI_CONFIG_DIR | Should -Not -BeNullOrEmpty
         $script:MIHOMO_USER_CONFIG_DIR | Should -Not -BeNullOrEmpty
-        $script:SINGBOX_USER_CONFIG_DIR | Should -Not -BeNullOrEmpty
     }
 }
 

@@ -324,16 +324,10 @@ pub(crate) fn load_theme(path: &std::path::Path) -> anyhow::Result<Theme> {
     let core_type = crate::config::CONFIG.core_type();
     let core_key = match core_type {
         CoreType::Mihomo => "mihomo",
-        CoreType::Singbox => "sing-box",
-    };
-    let other_key = match core_type {
-        CoreType::Mihomo => "sing-box",
-        CoreType::Singbox => "mihomo",
     };
 
     if let Some(core_section) = value.remove(core_key) {
         if let serde_yml::Value::Mapping(core_map) = core_section {
-            value.remove(other_key);
             for (k, v) in core_map {
                 value.insert(k, v);
             }

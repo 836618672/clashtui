@@ -11,20 +11,26 @@ pub fn request(
     sub_url: &str,
     payload: Option<String>,
 ) -> Result<minreq::Response> {
-    if sub_url != "/version" && crate::config::is_core_mismatch() {
-        return Err(minreq::Error::IoError(std::io::Error::other(
-            "core mismatch",
-        )));
+    let session = session::CoreSession::current();
+    let result = session.request(method, sub_url, payload);
+    if session.core_type() != CONFIG.core_type() {
+        return Err(session::api_error(session::ApiError::SessionChanged));
     }
-    let controller = CONFIG.controller_for_core();
-    let mut req = minreq::Request::new(method, format!("{controller}{sub_url}"));
-    if let Some(kv) = payload {
-        req = req
-            .with_header("Content-Type", "application/json")
-            .with_body(kv);
+    if sub_url != "/version" {
+        match &result {
+            Ok(_) => crate::config::set_core_mismatch(false),
+            Err(minreq::Error::IoError(error))
+                if matches!(
+                    error
+                        .get_ref()
+                        .and_then(|e| e.downcast_ref::<session::ApiError>()),
+                    Some(session::ApiError::CoreMismatch { .. })
+                ) =>
+            {
+                crate::config::set_core_mismatch(true);
+            }
+            _ => {}
+        }
     }
-    if let Some(s) = CONFIG.secret_for_core() {
-        req = req.with_header(headers::AUTHORIZATION, format!("Bearer {s}"));
-    }
-    req.with_timeout(timeout!()).send()
+    result
 }

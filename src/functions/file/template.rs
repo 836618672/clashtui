@@ -1,4 +1,4 @@
-use super::{PROFILE_JSONS_PATH, PROFILE_YAMLS_PATH, TEMPLATE_PATH};
+use super::{PROFILE_YAMLS_PATH, template_root};
 use crate::config::database::{ProfileType, ProxyProviderGroups};
 use anyhow::{Context as _, bail};
 use std::collections::{HashMap, HashSet};
@@ -76,7 +76,6 @@ pub fn resolve_template_placeholder(
     }
 }
 
-pub mod singbox;
 mod version1;
 
 /// Records a proxy name rename applied during deduplication.
@@ -134,7 +133,7 @@ pub(super) fn dedup_mihomo_proxy_names(
 }
 
 pub fn get_all_templates() -> std::io::Result<Vec<String>> {
-    Ok(std::fs::read_dir(TEMPLATE_PATH.as_path())?
+    Ok(std::fs::read_dir(template_root().as_path())?
         .collect::<std::io::Result<Vec<std::fs::DirEntry>>>()?
         .into_iter()
         .map(|p| {
@@ -148,7 +147,7 @@ pub fn get_all_templates() -> std::io::Result<Vec<String>> {
 /// Falls back to the legacy `template_proxy_providers.yaml` if the template
 /// file does not have a `clashtui.proxy_provider_groups` key.
 pub fn read_template_ppg(template_name: &str) -> anyhow::Result<ProxyProviderGroups> {
-    let path = TEMPLATE_PATH.join(template_name);
+    let path = template_root().join(template_name);
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read template: {}", path.display()))?;
     if content.trim().is_empty() {
@@ -169,8 +168,8 @@ pub fn read_template_ppg(template_name: &str) -> anyhow::Result<ProxyProviderGro
         })?;
 
     match groups {
-        Some(g) if !g.is_empty() => Ok(g),
-        _ => {
+        Some(g) => Ok(g),
+        None => {
             // Fall back to legacy standalone template_proxy_providers.yaml
             read_legacy_template_proxy_providers()
         }
@@ -181,7 +180,6 @@ pub fn read_template_ppg(template_name: &str) -> anyhow::Result<ProxyProviderGro
 fn read_legacy_template_proxy_providers() -> anyhow::Result<ProxyProviderGroups> {
     let subdir = match crate::config::CONFIG.core_type() {
         crate::config::CoreType::Mihomo => "mihomo",
-        crate::config::CoreType::Singbox => "sing-box",
     };
     let path = crate::config::config_dir_path()
         .join(subdir)
@@ -215,30 +213,6 @@ fn read_legacy_template_proxy_providers() -> anyhow::Result<ProxyProviderGroups>
 pub fn read_profile_ppg(profile_name: &str) -> anyhow::Result<ProxyProviderGroups> {
     let path = PROFILE_YAMLS_PATH.join(format!("{profile_name}.yaml"));
     if !path.exists() {
-        let json_path = PROFILE_JSONS_PATH.join(format!("{profile_name}.json"));
-        if json_path.exists() {
-            let content = std::fs::read_to_string(&json_path)
-                .with_context(|| format!("Failed to read profile: {}", json_path.display()))?;
-            if content.trim().is_empty() {
-                return Ok(ProxyProviderGroups::new());
-            }
-            let value: serde_json::Value = serde_json::from_str(&content).with_context(|| {
-                format!("Failed to parse profile JSON: {}", json_path.display())
-            })?;
-            let groups = value
-                .get("clashtui")
-                .and_then(|c| c.get("proxy_provider_groups"))
-                .map(|g| serde_json::from_value(g.clone()))
-                .transpose()
-                .with_context(|| {
-                    format!(
-                        "Failed to parse clashtui.proxy_provider_groups in: {}",
-                        json_path.display()
-                    )
-                })?
-                .unwrap_or_default();
-            return Ok(groups);
-        }
         return Ok(ProxyProviderGroups::new());
     }
     let content = std::fs::read_to_string(&path)
@@ -266,7 +240,9 @@ pub fn read_profile_ppg(profile_name: &str) -> anyhow::Result<ProxyProviderGroup
 /// Write or update `clashtui.proxy_provider_groups` in a template file.
 /// Other keys in the file are preserved unchanged.
 pub fn write_template_ppg(template_name: &str, groups: &ProxyProviderGroups) -> anyhow::Result<()> {
-    let path = TEMPLATE_PATH.join(template_name);
+    let _write = super::coordination::WriteGuard::acquire()?;
+    super::profile::validate_profile_name(template_name)?;
+    let path = template_root().join(template_name);
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("Failed to read template: {}", path.display()))?;
     let mut value: serde_yml::Value = serde_yml::from_str(&content)
@@ -284,9 +260,8 @@ pub fn write_template_ppg(template_name: &str, groups: &ProxyProviderGroups) -> 
         .insert("proxy_provider_groups".into(), serde_yml::to_value(groups)?);
 
     // atomic write
-    let tmp_path = path.with_extension("yaml.tmp");
-    serde_yml::to_writer(std::fs::File::create(&tmp_path)?, &value)?;
-    std::fs::rename(&tmp_path, &path)?;
+    let bytes = serde_yml::to_string(&value)?;
+    super::activation::atomic_write(&path, bytes.as_bytes())?;
     Ok(())
 }
 
@@ -295,38 +270,21 @@ pub fn write_template_ppg(template_name: &str, groups: &ProxyProviderGroups) -> 
 pub fn check_template_ppg_availability(
     profile: &crate::config::database::Profile,
 ) -> anyhow::Result<()> {
-    let template = match &profile.dtype {
+    let _template = match &profile.dtype {
         ProfileType::Template { template } => template,
         _ => return Ok(()),
     };
 
-    let groups = read_profile_ppg(&profile.name)?;
-    if groups.is_empty() {
-        return Ok(());
-    }
-
-    let is_singbox = crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox;
-    let _tpl_name = std::path::Path::new(template)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(template);
-
-    let mut missing: Vec<String> = Vec::new();
-    for providers in groups.values() {
-        for (name, url) in providers {
-            let path = if is_singbox {
-                let hash = format!("{:x}", md5::compute(url.as_bytes()));
-                crate::config::singbox_proxy_providers_path().join(format!("{hash}.json"))
-            } else {
-                let cfg_dir = std::path::PathBuf::from(
-                    &crate::config::CONFIG.cfg_file.mihomo.core.config_dir,
-                );
-                let hash = format!("{:x}", md5::compute(url.as_bytes()));
-                cfg_dir.join(format!("proxies/{hash}"))
-            };
-            if !path.exists() {
-                missing.push(format!("  {name} ({url}) -> {}", path.display()));
-            }
+    use super::net_resource::{ExtractNetResources, ResourceSection};
+    let path = PROFILE_YAMLS_PATH.join(format!("{}.yaml", profile.name));
+    let mapping: serde_yml::Mapping = serde_yml::from_slice(&std::fs::read(path)?)?;
+    super::net_resource::validate_cache_paths(&mapping)?;
+    let root = std::path::Path::new(&crate::config::CONFIG.cfg_file.mihomo.core.config_dir);
+    let mut missing = Vec::new();
+    for resource in mapping.extract(&[ResourceSection::ProxyProvider]) {
+        let path = super::net_resource::cache_path(root, &resource.path)?;
+        if !path.is_file() {
+            missing.push(format!("  {} -> {}", resource.name, path.display()));
         }
     }
 
@@ -341,8 +299,12 @@ pub fn check_template_ppg_availability(
 }
 
 pub fn apply_template(template_name: &str, profile_name: &str) -> anyhow::Result<()> {
+    let _write = super::coordination::WriteGuard::acquire()?;
+    super::profile::validate_profile_name(template_name)?;
+    super::profile::validate_profile_name(profile_name)?;
+    validate_generation_target(template_name, profile_name)?;
     let groups = read_template_ppg(template_name)?;
-    let path = TEMPLATE_PATH.join(template_name);
+    let path = template_root().join(template_name);
     let file = std::fs::File::open(&path)
         .inspect_err(|e| log::error!("Founding template {template_name}:{e}"))?;
     let map: serde_yml::Mapping = serde_yml::from_reader(file)?;
@@ -351,65 +313,113 @@ pub fn apply_template(template_name: &str, profile_name: &str) -> anyhow::Result
         .and_then(|v| v.as_u64())
     {
         None | Some(1) => version1::gen_template(map, template_name, &groups)?,
-        Some(_) => unimplemented!(),
+        Some(version) => anyhow::bail!("Unsupported template version: {version}"),
     };
     let output_path = PROFILE_YAMLS_PATH.join(format!("{profile_name}.yaml"));
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     // atomic write
-    let tmp_path = output_path.with_extension("yaml.tmp");
-    serde_yml::to_writer(std::fs::File::create(&tmp_path)?, &gened)?;
-    std::fs::rename(&tmp_path, &output_path)?;
+    register_generated(
+        &output_path,
+        serde_yml::to_string(&gened)?.as_bytes(),
+        profile_name,
+        template_name,
+    )
+}
+
+/// Render without registering a profile or replacing its file.
+pub async fn preview_template(template_name: &str, with_proxy: bool) -> anyhow::Result<String> {
+    let name = template_name.to_owned();
+    super::coordination::transaction(move || async move {
+        preview_template_locked(&name, with_proxy).await
+    })
+    .await
+}
+
+async fn preview_template_locked(template_name: &str, _with_proxy: bool) -> anyhow::Result<String> {
+    super::profile::validate_profile_name(template_name)?;
+    let groups = read_template_ppg(template_name)?;
+    let content = std::fs::read_to_string(template_root().join(template_name))?;
+    match crate::config::CONFIG.core_type() {
+        crate::config::CoreType::Mihomo => {
+            let map: serde_yml::Mapping = serde_yml::from_str(&content)?;
+            match map
+                .get("clashtui_template_version")
+                .and_then(|v| v.as_u64())
+            {
+                None | Some(1) => Ok(serde_yml::to_string(&version1::gen_template(
+                    map,
+                    template_name,
+                    &groups,
+                )?)?),
+                Some(version) => anyhow::bail!("Unsupported template version: {version}"),
+            }
+        }
+    }
+}
+
+fn register_generated(
+    path: &std::path::Path,
+    bytes: &[u8],
+    profile_name: &str,
+    template_name: &str,
+) -> anyhow::Result<()> {
+    let mapping: serde_yml::Mapping = serde_yml::from_slice(bytes)?;
+    super::net_resource::validate_cache_paths(&mapping)?;
+    let staged = super::activation::TemporaryFile::create_beside(path, bytes)?;
+    crate::functions::command::check_config(&staged.0)
+        .context("Generated template failed core validation; profile was preserved")?;
+    drop(staged);
     let mut pm = pm!();
+    pm.ensure_loaded()?;
+    let previous_profile = pm.get(profile_name);
+    let previous_file = match std::fs::read(path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let old_database = pm.clone();
+    super::activation::atomic_write(path, bytes)?;
     pm.insert(
         profile_name,
         ProfileType::Template {
             template: template_name.to_owned(),
         },
     );
-    pm.to_file()?;
+    if let Some(previous) = previous_profile {
+        let data = pm.active_mut().profiles.get_mut(profile_name).unwrap();
+        data.no_pp = previous.no_pp;
+        data.update_with_proxy = previous.update_with_proxy;
+    }
+    if let Err(error) = pm.to_file() {
+        *pm = old_database;
+        let recovery = match previous_file {
+            Some(bytes) => super::activation::atomic_write(path, &bytes),
+            None => std::fs::remove_file(path).map_err(Into::into),
+        };
+        anyhow::bail!(
+            "Generated profile registration failed: {error}; restoring output: {recovery:?}"
+        );
+    }
     Ok(())
 }
 
-pub async fn apply_template_singbox(
-    template_name: &str,
-    profile_name: &str,
-    with_proxy: bool,
-    force_refresh: bool,
-) -> anyhow::Result<()> {
-    let groups = read_template_ppg(template_name)?;
-    let path = TEMPLATE_PATH.join(template_name);
-    let file = std::fs::File::open(&path)
-        .inspect_err(|e| log::error!("Opening template {template_name}:{e}"))?;
-    let map: serde_json::Value = serde_json::from_reader(file)?;
-    let gened =
-        singbox::gen_template_singbox(&map, template_name, &groups, with_proxy, force_refresh)
-            .await?;
-    let output_path = PROFILE_JSONS_PATH.join(format!("{profile_name}.json"));
-    if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)?;
+fn validate_generation_target(template_name: &str, profile_name: &str) -> anyhow::Result<()> {
+    if let Some(profile) = super::profile::db::get(profile_name) {
+        anyhow::ensure!(
+            matches!(&profile.dtype, ProfileType::Template { template } if template == template_name),
+            "Generated name belongs to a different profile; choose another name"
+        );
     }
-    // atomic write
-    let tmp_path = output_path.with_extension("json.tmp");
-    let file = std::fs::File::create(&tmp_path)?;
-    serde_json::to_writer_pretty(file, &gened)?;
-    std::fs::rename(&tmp_path, &output_path)?;
-    let mut pm = pm!();
-    pm.insert(
-        profile_name,
-        ProfileType::Template {
-            template: template_name.to_owned(),
-        },
-    );
-    pm.to_file()?;
     Ok(())
 }
 
 const PROXY_PROVIDERS: &str = "proxy-providers";
 const PROXY_GROUPS: &str = "proxy-groups";
 const PROXIES: &str = "proxies";
-const RULE_PROVIDERS: &str = "rule-providers";
+
+#[cfg(test)]
 const RULES: &str = "rules";
 
 /// Remove net resource sections (`proxy-providers`, `rule-providers`) and embed
@@ -426,6 +436,7 @@ pub async fn update_profile_without_pp(
 )> {
     use crate::functions::file::net_resource::{NetResourceUpdate, ResourceSection};
     use std::collections::HashMap;
+    super::net_resource::validate_cache_paths(&tpl)?;
 
     let mut statuses: Vec<NetResourceUpdate> = Vec::new();
 
@@ -457,12 +468,27 @@ pub async fn update_profile_without_pp(
             let cfg_dir =
                 std::path::PathBuf::from(&crate::config::CONFIG.cfg_file.mihomo.core.config_dir);
             download_handles.push(tokio::task::spawn_blocking(move || {
+                if !pp_path.is_empty()
+                    && let Err(error) = super::net_resource::cache_path(&cfg_dir, &pp_path)
+                {
+                    return (pp_name_clone, url, pp_path, Err(error.to_string()));
+                }
                 // Try pp_path first, then fallback to hash-based cache path
                 for candidate in [pp_path.as_str(), fallback_path.as_str()] {
                     if candidate.is_empty() {
                         continue;
                     }
-                    let dest = cfg_dir.join(candidate);
+                    let dest = match super::net_resource::cache_path(&cfg_dir, candidate) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            return (
+                                pp_name_clone,
+                                url,
+                                candidate.to_owned(),
+                                Err(error.to_string()),
+                            );
+                        }
+                    };
                     if let Ok(buf) = std::fs::read(&dest)
                         && let Ok(yaml) = serde_yml::from_slice::<serde_yml::Mapping>(&buf)
                     {
@@ -476,12 +502,21 @@ pub async fn update_profile_without_pp(
                             return (pp_name_clone, url, pp_path, Err(e.to_string()));
                         }
                         if !pp_path.is_empty() {
-                            let dest = cfg_dir.join(&pp_path);
-                            if serde_yml::from_slice::<serde_yml::Mapping>(&buf).is_ok() {
-                                if let Some(parent) = dest.parent() {
-                                    let _ = std::fs::create_dir_all(parent);
+                            let dest = match super::net_resource::cache_path(&cfg_dir, &pp_path) {
+                                Ok(path) => path,
+                                Err(error) => {
+                                    return (pp_name_clone, url, pp_path, Err(error.to_string()));
                                 }
-                                let _ = std::fs::write(&dest, &buf);
+                            };
+                            if serde_yml::from_slice::<serde_yml::Mapping>(&buf).is_ok() {
+                                if let Some(parent) = dest.parent()
+                                    && let Err(error) = std::fs::create_dir_all(parent)
+                                {
+                                    return (pp_name_clone, url, pp_path, Err(error.to_string()));
+                                }
+                                if let Err(error) = super::activation::atomic_write(&dest, &buf) {
+                                    return (pp_name_clone, url, pp_path, Err(error.to_string()));
+                                }
                             }
                         }
                         let yaml = serde_yml::from_slice::<serde_yml::Mapping>(&buf)
@@ -534,96 +569,10 @@ pub async fn update_profile_without_pp(
         tpl = inline_proxy_providers(tpl, pp_proxies)?;
     }
 
-    // --- Rule-Providers ---
-    #[derive(serde::Deserialize, Debug)]
-    struct RPitem {
-        url: Option<String>,
-        #[serde(flatten)]
-        __others: serde_yml::Value,
-    }
-
-    if let Some(rps) = tpl.remove(RULE_PROVIDERS) {
-        let rps: HashMap<String, RPitem> = serde_yml::from_value(rps)?;
-
-        let mut download_handles = Vec::new();
-        for (rp_name, rp) in rps {
-            let Some(url) = rp.url else {
-                continue;
-            };
-            let rp_name_clone = rp_name.clone();
-            let rp_path = rp
-                .__others
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_owned();
-            let cfg_dir =
-                std::path::PathBuf::from(&crate::config::CONFIG.cfg_file.mihomo.core.config_dir);
-            download_handles.push(tokio::task::spawn_blocking(move || {
-                if !rp_path.is_empty() {
-                    let dest = cfg_dir.join(&rp_path);
-                    if let Ok(buf) = std::fs::read(&dest)
-                        && let Ok(yaml) = serde_yml::from_slice::<serde_yml::Mapping>(&buf)
-                    {
-                        return (rp_name_clone, url, rp_path, Ok(yaml));
-                    }
-                }
-                match crate::functions::restful::download::profile(&url, with_proxy) {
-                    Ok(mut rdr) => {
-                        let mut buf = Vec::new();
-                        if let Err(e) = std::io::Read::read_to_end(&mut rdr, &mut buf) {
-                            return (rp_name_clone, url, rp_path, Err(e.to_string()));
-                        }
-                        if !rp_path.is_empty() {
-                            let dest = cfg_dir.join(&rp_path);
-                            if let Some(parent) = dest.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            let _ = std::fs::write(&dest, &buf);
-                        }
-                        let yaml = serde_yml::from_slice::<serde_yml::Mapping>(&buf)
-                            .map_err(|e| e.to_string());
-                        (rp_name_clone, url, rp_path, yaml)
-                    }
-                    Err(e) => (rp_name_clone, url, rp_path, Err(e.to_string())),
-                }
-            }));
-        }
-
-        let mut all_rules: Vec<serde_yml::Value> = Vec::new();
-        for handle in download_handles {
-            let (rp_name, url, rp_path, result) = handle.await?;
-            match result {
-                Ok(mut loaded) => {
-                    let rules: Vec<serde_yml::Value> = loaded
-                        .remove("payload")
-                        .or_else(|| loaded.remove(RULES))
-                        .and_then(|v| serde_yml::from_value(v).ok())
-                        .unwrap_or_default();
-                    all_rules.extend(rules);
-                    statuses.push(NetResourceUpdate {
-                        name: rp_name,
-                        url,
-                        path: rp_path,
-                        section: ResourceSection::RuleProvider,
-                        ok: true,
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    statuses.push(NetResourceUpdate {
-                        name: rp_name,
-                        url,
-                        path: rp_path,
-                        section: ResourceSection::RuleProvider,
-                        ok: false,
-                        error: Some(e),
-                    });
-                }
-            }
-        }
-        tpl = inline_rule_providers(tpl, &all_rules);
-    }
+    // no_pp inlines proxy subscriptions. Keep rule providers and their
+    // RULE-SET references intact: Mihomo supports all behaviors and MRS here.
+    let rule_statuses = fetch_rule_resource_statuses(&tpl, with_proxy).await;
+    statuses.extend(rule_statuses);
 
     Ok((tpl, statuses))
 }
@@ -683,7 +632,8 @@ pub fn inline_proxy_providers(
     Ok(tpl)
 }
 
-pub fn inline_rule_providers(
+#[cfg(test)]
+fn inline_rule_providers(
     mut tpl: serde_yml::Mapping,
     all_rules: &[serde_yml::Value],
 ) -> serde_yml::Mapping {
@@ -706,162 +656,42 @@ pub async fn fetch_net_resource_statuses(
     yaml: &serde_yml::Mapping,
     with_proxy: bool,
 ) -> Vec<crate::functions::file::net_resource::NetResourceUpdate> {
-    use crate::functions::file::net_resource::{
-        ExtractNetResources, NetResourceUpdate, ResourceSection,
-    };
+    use crate::functions::file::net_resource::{ExtractNetResources, ResourceSection};
 
     let resources = yaml.extract(&[
         ResourceSection::ProxyProvider,
         ResourceSection::RuleProvider,
     ]);
-
-    if resources.is_empty() {
-        return Vec::new();
-    }
-
-    let mut handles = Vec::with_capacity(resources.len());
-    for resource in resources {
-        let url = resource.url;
-        let name = resource.name;
-        let path = std::path::PathBuf::from(&crate::config::CONFIG.cfg_file.mihomo.core.config_dir)
-            .join(&resource.path);
-        let section = resource.section;
-        handles.push(tokio::task::spawn_blocking(move || {
-            match crate::functions::restful::download::profile(&url, with_proxy) {
-                Ok(mut rdr) => {
-                    let mut buf = Vec::new();
-                    if let Err(e) = std::io::Read::read_to_end(&mut rdr, &mut buf) {
-                        return (name, url, path, section, false, Some(e.to_string()));
-                    }
-                    if let Some(parent) = path.parent()
-                        && let Err(e) = std::fs::create_dir_all(parent)
-                    {
-                        return (name, url, path, section, false, Some(e.to_string()));
-                    }
-                    if serde_yml::from_slice::<serde_yml::Mapping>(&buf).is_err() {
-                        return (
-                            name,
-                            url,
-                            path,
-                            section,
-                            false,
-                            Some("Invalid YAML format".to_string()),
-                        );
-                    }
-                    match std::fs::write(&path, &buf) {
-                        Ok(()) => (name, url, path, section, true, None),
-                        Err(e) => (name, url, path, section, false, Some(e.to_string())),
-                    }
-                }
-                Err(e) => (name, url, path, section, false, Some(e.to_string())),
-            }
-        }));
-    }
-
-    let mut statuses = Vec::with_capacity(handles.len());
-    for handle in handles {
-        let (name, url, path, section, ok, error) = match handle.await {
-            Ok(v) => v,
-            Err(e) => {
-                statuses.push(NetResourceUpdate {
-                    name: String::new(),
-                    url: String::new(),
-                    path: String::new(),
-                    section: ResourceSection::ProxyProvider,
-                    ok: false,
-                    error: Some(e.to_string()),
-                });
-                continue;
-            }
-        };
-        statuses.push(NetResourceUpdate {
-            path: path.display().to_string(),
-            name,
-            url,
-            section,
-            ok,
-            error,
-        });
-    }
-
-    statuses
+    download_resources(resources, with_proxy).await
 }
 
-pub async fn fetch_net_resource_statuses_from_resources(
-    resources: &[crate::functions::file::net_resource::NetResource],
-    base_dir: &std::path::Path,
+async fn fetch_rule_resource_statuses(
+    yaml: &serde_yml::Mapping,
     with_proxy: bool,
-) -> Vec<crate::functions::file::net_resource::NetResourceUpdate> {
-    use crate::functions::file::net_resource::{NetResourceUpdate, ResourceSection};
+) -> Vec<super::net_resource::NetResourceUpdate> {
+    use super::net_resource::{ExtractNetResources, ResourceSection};
+    download_resources(yaml.extract(&[ResourceSection::RuleProvider]), with_proxy).await
+}
 
-    if resources.is_empty() {
-        return Vec::new();
+pub async fn download_resources(
+    resources: Vec<super::net_resource::NetResource>,
+    with_proxy: bool,
+) -> Vec<super::net_resource::NetResourceUpdate> {
+    let mut statuses = Vec::new();
+    for resource in resources {
+        let fallback = resource.clone();
+        match tokio::task::spawn_blocking(move || resource.download(with_proxy)).await {
+            Ok(status) => statuses.push(status),
+            Err(error) => statuses.push(super::net_resource::NetResourceUpdate {
+                name: fallback.name,
+                url: fallback.url,
+                path: fallback.path,
+                section: fallback.section,
+                ok: false,
+                error: Some(error.to_string()),
+            }),
+        }
     }
-
-    let mut handles = Vec::with_capacity(resources.len());
-    for resource in resources.iter().cloned() {
-        let url = resource.url;
-        let name = resource.name;
-        let path = base_dir.join(&resource.path);
-        let section = resource.section;
-        handles.push(tokio::task::spawn_blocking(move || {
-            match crate::functions::restful::download::profile(&url, with_proxy) {
-                Ok(mut rdr) => {
-                    let mut buf = Vec::new();
-                    if let Err(e) = std::io::Read::read_to_end(&mut rdr, &mut buf) {
-                        return (name, url, path, section, false, Some(e.to_string()));
-                    }
-                    if let Some(parent) = path.parent()
-                        && let Err(e) = std::fs::create_dir_all(parent)
-                    {
-                        return (name, url, path, section, false, Some(e.to_string()));
-                    }
-                    if serde_yml::from_slice::<serde_yml::Mapping>(&buf).is_err() {
-                        return (
-                            name,
-                            url,
-                            path,
-                            section,
-                            false,
-                            Some("Invalid YAML format".to_string()),
-                        );
-                    }
-                    match std::fs::write(&path, &buf) {
-                        Ok(()) => (name, url, path, section, true, None),
-                        Err(e) => (name, url, path, section, false, Some(e.to_string())),
-                    }
-                }
-                Err(e) => (name, url, path, section, false, Some(e.to_string())),
-            }
-        }));
-    }
-
-    let mut statuses = Vec::with_capacity(handles.len());
-    for handle in handles {
-        let (name, url, path, section, ok, error) = match handle.await {
-            Ok(v) => v,
-            Err(e) => {
-                statuses.push(NetResourceUpdate {
-                    name: String::new(),
-                    url: String::new(),
-                    path: String::new(),
-                    section: ResourceSection::ProxyProvider,
-                    ok: false,
-                    error: Some(e.to_string()),
-                });
-                continue;
-            }
-        };
-        statuses.push(NetResourceUpdate {
-            path: path.display().to_string(),
-            name,
-            url,
-            section,
-            ok,
-            error,
-        });
-    }
-
     statuses
 }
 

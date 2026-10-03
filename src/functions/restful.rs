@@ -3,6 +3,10 @@ use minreq::Method;
 
 pub mod config_struct;
 pub mod core_detect;
+pub mod metrics;
+pub mod resources;
+pub mod session;
+pub mod stream;
 #[macro_use]
 mod utils;
 
@@ -31,6 +35,10 @@ pub mod control {
             Some(payload.unwrap_or(DEFAULT_PAYLOAD.to_string())),
         )
         .map(|_| ())
+    }
+
+    pub fn upgrade() -> Result<()> {
+        request(Method::Post, "/upgrade", Some("{}".to_owned())).map(|_| ())
     }
 
     /// Get clash core version
@@ -77,6 +85,64 @@ pub mod config {
         request(Method::Get, "/configs", None).and_then(|r| r.json())
     }
 
+    pub fn fetch_raw() -> Result<serde_json::Value> {
+        request(Method::Get, "/configs", None).and_then(|r| r.json())
+    }
+
+    pub const WRITABLE: &[&str] = &[
+        "mode",
+        "log-level",
+        "allow-lan",
+        "bind-address",
+        "ipv6",
+        "port",
+        "socks-port",
+        "redir-port",
+        "tproxy-port",
+        "mixed-port",
+        "tun",
+        "unified-delay",
+        "tcp-concurrent",
+        "find-process-mode",
+        "global-client-fingerprint",
+        "global-ua",
+        "geodata-mode",
+        "geo-auto-update",
+        "geo-update-interval",
+        "interface-name",
+    ];
+
+    pub fn writable_fields(
+        current: &serde_json::Value,
+        core: crate::config::CoreType,
+    ) -> Vec<&'static str> {
+        WRITABLE
+            .iter()
+            .copied()
+            .filter(|key| {
+                current.get(*key).is_some_and(|value| !value.is_null())
+                    && (core == crate::config::CoreType::Mihomo || *key == "mode")
+            })
+            .collect()
+    }
+
+    pub fn patch_checked(patch: serde_json::Value) -> anyhow::Result<config_struct::ClashConfig> {
+        let session = session::CoreSession::current();
+        let current: serde_json::Value = session.request(Method::Get, "/configs", None)?.json()?;
+        let fields = patch
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("Patch must be a JSON object"))?;
+        anyhow::ensure!(!fields.is_empty(), "Patch is empty");
+        let available = writable_fields(&current, session.core_type());
+        for key in fields.keys() {
+            anyhow::ensure!(
+                available.contains(&key.as_str()),
+                "Field unavailable or read-only: {key}"
+            );
+        }
+        Ok(session.patch_and_fetch(patch.to_string())?)
+    }
+
     pub fn reload<S: AsRef<str>>(path: S) -> Result<String> {
         request(
             Method::Put,
@@ -102,9 +168,38 @@ pub mod config {
         })
     }
 
-    pub fn patch(payload: String) -> Result<String> {
-        request(Method::Patch, "/configs", Some(payload))
-            .and_then(|r| r.as_str().map(|s| s.to_owned()))
+    /// Local service managers may return before the controller accepts requests.
+    pub fn wait_until_ready() -> Result<()> {
+        let mut last_error = None;
+        for attempt in 0..10 {
+            let session = session::CoreSession::current();
+            if !session.is_current() {
+                return Err(minreq::Error::IoError(std::io::Error::other(
+                    "Core session changed",
+                )));
+            }
+            let ready = session
+                .request(minreq::Method::Get, "/version", None)
+                .and_then(|response| super::core_detect::parse_core_type(response.json()?))
+                .and_then(|_| fetch());
+            match ready {
+                Ok(_) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < 9 {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+        Err(last_error.expect("at least one controller read was attempted"))
+    }
+
+    pub fn patch_and_fetch(payload: String) -> Result<config_struct::ClashConfig> {
+        let session = session::CoreSession::current();
+        let config = session.patch_and_fetch(payload);
+        if session.core_type() != CONFIG.core_type() {
+            return Err(session::api_error(session::ApiError::SessionChanged));
+        }
+        config
     }
 }
 
@@ -173,18 +268,19 @@ pub mod download {
         }
         req = req.with_timeout(timeout!()).with_header(
             headers::USER_AGENT,
-            CONFIG.global_ua.as_deref().unwrap_or_else(|| {
-                if CONFIG.core_type() == crate::config::CoreType::Singbox {
-                    "sing-box"
-                } else {
-                    "clash.meta"
-                }
-            }),
+            CONFIG.global_ua.as_deref().unwrap_or("clash.meta"),
         );
         if let Some(auth) = auth_header {
             req = req.with_header(headers::AUTHORIZATION, auth);
         }
-        req.send_lazy()
+        let response = req.send_lazy()?;
+        if !(200..300).contains(&response.status_code) {
+            return Err(minreq::Error::IoError(std::io::Error::other(format!(
+                "Subscription download failed: HTTP {}",
+                response.status_code
+            ))));
+        }
+        Ok(response)
     }
 
     pub fn fetch_subscription_userinfo(url: &str, with_proxy: bool) -> Result<Option<String>> {
@@ -193,13 +289,7 @@ pub mod download {
             .with_timeout(timeout!())
             .with_header(
                 headers::USER_AGENT,
-                CONFIG.global_ua.as_deref().unwrap_or_else(|| {
-                    if CONFIG.core_type() == crate::config::CoreType::Singbox {
-                        "sing-box"
-                    } else {
-                        "clash.meta"
-                    }
-                }),
+                CONFIG.global_ua.as_deref().unwrap_or("clash.meta"),
             );
         if with_proxy {
             req = req.with_proxy(minreq::Proxy::new(&CONFIG.proxy_addr)?);
@@ -208,6 +298,12 @@ pub mod download {
             req = req.with_header(headers::AUTHORIZATION, auth);
         }
         let resp = req.send()?;
+        if !(200..300).contains(&resp.status_code) {
+            return Err(minreq::Error::IoError(std::io::Error::other(format!(
+                "Subscription metadata failed: HTTP {}",
+                resp.status_code
+            ))));
+        }
         let info: Option<String> = resp.headers.get("subscription-userinfo").cloned();
         Ok(info)
     }
@@ -269,9 +365,10 @@ pub mod connection {
         pub connections: Option<Vec<Conn>>,
     }
 
-    #[cfg_attr(test, derive(Debug, Clone))]
-    #[derive(Deserialize)]
+    #[derive(Debug, Clone, serde::Serialize, Deserialize)]
     pub struct Conn {
+        #[serde(flatten)]
+        pub extra: std::collections::HashMap<String, serde_json::Value>,
         pub id: String,
         pub metadata: ConnMetaData,
         pub upload: u64,
@@ -286,10 +383,11 @@ pub mod connection {
         pub rule_payload: Option<String>,
     }
 
-    #[cfg_attr(test, derive(Debug, Clone))]
-    #[derive(Deserialize)]
+    #[derive(Debug, Clone, serde::Serialize, Deserialize)]
     #[serde(rename_all = "camelCase")]
     pub struct ConnMetaData {
+        #[serde(flatten)]
+        pub extra: std::collections::HashMap<String, serde_json::Value>,
         #[cfg_attr(not(test), allow(dead_code))]
         pub network: String,
         #[serde(rename = "type", default)]
@@ -329,6 +427,17 @@ pub mod connection {
         request(Method::Delete, "/connections", None).map(|_| ())
     }
 
+    /// Close an immutable selection; continue after an individual failure.
+    pub fn terminate_ids(ids: &[String]) -> Vec<String> {
+        ids.iter()
+            .filter_map(|id| match terminate_connection(Some(id.clone())) {
+                Ok(true) => None,
+                Ok(false) => Some(format!("{id}: closure not confirmed")),
+                Err(error) => Some(format!("{id}: {error}")),
+            })
+            .collect()
+    }
+
     /// if `id` is some, will try to terminate that connection,
     /// otherwise try to terminate **all** connections.
     ///
@@ -341,7 +450,8 @@ pub mod connection {
             Method::Delete,
             &format!(
                 "/connections{}",
-                id.map(|c| format!("/{c}")).unwrap_or_default()
+                id.map(|c| format!("/{}", resources::encode_path(&c)))
+                    .unwrap_or_default()
             ),
             None,
         )
@@ -357,6 +467,7 @@ pub mod connection {
 
 pub mod api_log {
 
+    #[derive(Clone, serde::Serialize)]
     pub struct LogEntry {
         pub type_: String,
         pub payload: String,
@@ -440,71 +551,4 @@ pub mod api_log {
 }
 
 #[cfg(test)]
-mod connection_tests {
-    use super::connection::*;
-
-    fn load_singbox_connections() -> ConnInfo {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/apidata/sing-box/connections.json"
-        );
-        let data = std::fs::read_to_string(path).unwrap();
-        serde_json::from_str(&data).unwrap()
-    }
-
-    #[test]
-    fn singbox_conninfo_totals() {
-        let info = load_singbox_connections();
-        assert!(info.download_total > 0);
-        assert!(info.upload_total > 0);
-    }
-
-    #[test]
-    fn singbox_connections_has_entries() {
-        let info = load_singbox_connections();
-        let conns = info.connections.expect("connections missing");
-        assert!(!conns.is_empty());
-    }
-
-    #[test]
-    fn singbox_conn_has_chains() {
-        let info = load_singbox_connections();
-        let conn = &info.connections.unwrap()[0];
-        assert!(!conn.chains.is_empty());
-    }
-
-    #[test]
-    fn singbox_conn_metadata_empty_process_path() {
-        let info = load_singbox_connections();
-        for conn in info.connections.unwrap() {
-            assert_eq!(conn.metadata.process_path, "");
-        }
-    }
-
-    #[test]
-    fn singbox_conn_rule_is_some() {
-        let info = load_singbox_connections();
-        for conn in info.connections.unwrap() {
-            assert!(conn.rule.is_some());
-        }
-    }
-
-    #[test]
-    fn singbox_conn_udp_connection() {
-        let info = load_singbox_connections();
-        let conns = info.connections.unwrap();
-        let udp = conns
-            .iter()
-            .find(|c| c.metadata.network == "udp")
-            .expect("UDP connection missing");
-        assert_eq!(udp.metadata.destination_port, "53");
-        assert_eq!(udp.metadata.host, "");
-    }
-
-    #[test]
-    fn singbox_conn_has_destination_ip() {
-        let info = load_singbox_connections();
-        let conns = info.connections.unwrap();
-        assert!(conns[0].metadata.destination_ip.is_some());
-    }
-}
+mod connection_tests {}

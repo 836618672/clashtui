@@ -184,12 +184,11 @@ fn split_sections(
     value: &mut serde_yml::Mapping,
 ) -> (serde_yml::Mapping, Option<serde_yml::Mapping>) {
     let mihomo = take_mapping(value, "mihomo");
-    let singbox = take_mapping(value, "sing-box");
+    value.remove("sing-box"); // Ignore obsolete per-core overrides.
 
     let core_type = crate::config::CONFIG.core_type();
     let core_specific = match core_type {
         CoreType::Mihomo => mihomo,
-        CoreType::Singbox => singbox,
     };
 
     (value.clone(), core_specific)

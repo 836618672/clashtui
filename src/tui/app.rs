@@ -71,6 +71,8 @@ impl App {
                 LogsTab::default().into(),
                 SettingsTab::default().into(),
                 CoreSrvCtlTab::default().into(),
+                RulesTab::default().into(),
+                ProvidersTab::default().into(),
             ],
             popup: PopUp::default(),
             chord: ChordHandler::default(),
@@ -88,10 +90,7 @@ impl App {
         }
         use std::io::Write;
 
-        let dirs_to_check = [
-            &crate::config::CONFIG.cfg_file.mihomo.core.config_dir,
-            &crate::config::CONFIG.cfg_file.singbox.core.config_dir,
-        ];
+        let dirs_to_check = [&crate::config::CONFIG.cfg_file.mihomo.core.config_dir];
 
         for dir_str in &dirs_to_check {
             if dir_str.is_empty() {
@@ -147,7 +146,9 @@ impl App {
 
         app.check_startup_perms();
         while !QUIT.load(Ordering::Relaxed) {
-            if crate::tui::EXT_PROC.load(Ordering::SeqCst) {
+            if crate::tui::EXT_PROC.load(Ordering::SeqCst)
+                || super::term::SUSPENDED.load(Ordering::Acquire)
+            {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 continue;
             }
@@ -168,9 +169,12 @@ impl App {
                     _ = &mut tick => continue,
                     // if we switch between screens
                     _ = FULL_RENDER.notified() => {
-                        // first we hold tui for output
-                        FULL_RENDER.notified().await;
-                        // then we tell ratatui to re-render everything
+                        // Notifications may coalesce when an editor exits immediately.
+                        // Terminal ownership is state, not a pair of notifications.
+                        if super::term::SUSPENDED.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        // Tell ratatui to re-render everything on return.
                         terminal.clear()?;
                         continue
                     },
@@ -225,9 +229,6 @@ impl App {
                             let dir_str = match crate::config::CONFIG.core_type() {
                                 crate::config::CoreType::Mihomo => {
                                     &crate::config::CONFIG.cfg_file.mihomo.core.config_dir
-                                }
-                                crate::config::CoreType::Singbox => {
-                                    &crate::config::CONFIG.cfg_file.singbox.core.config_dir
                                 }
                             };
                             let parent = std::path::Path::new(dir_str)
@@ -447,10 +448,13 @@ impl App {
     }
     /// Global layer (4) — last resort: Tab switch, Quit, Help
     fn handle_global_kv(&mut self, kv: &Key) -> bool {
-        const TAB_COUNT: u8 = 7;
+        let tab_count = self.tabs.len() as u8;
         match kv.code {
-            KeyCode::Char(c @ '1'..='7') if !kv.ctrl && !kv.alt && !kv.super_ => {
+            KeyCode::Char(c @ '1'..='9') if !kv.ctrl && !kv.alt && !kv.super_ => {
                 let new_index = c as u8 - b'1';
+                if new_index >= tab_count {
+                    return false;
+                }
                 if new_index != self.tab_index {
                     self.tabs[self.tab_index as usize].on_leave();
                     self.tab_index = new_index;
@@ -460,7 +464,7 @@ impl App {
             }
             KeyCode::Tab if !kv.ctrl && !kv.alt && !kv.super_ => {
                 let old_index = self.tab_index;
-                if self.tab_index == TAB_COUNT - 1 {
+                if self.tab_index == tab_count - 1 {
                     self.tab_index = 0;
                 } else {
                     self.tab_index += 1;
@@ -605,7 +609,7 @@ fn render_footer(
     let help = if area.width < 60 {
         " ? Help  Tab Next  q Quit"
     } else {
-        " ? All shortcuts   Tab / 1–7 Switch tab   q Quit"
+        " ? All shortcuts   Tab / 1–9 Switch tab   q Quit"
     };
     f.render_widget(
         Paragraph::new(vec![Line::from(spans), Line::styled(help, section.muted)]),

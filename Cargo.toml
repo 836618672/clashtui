@@ -3,9 +3,10 @@ name = "clashtui"
 # General release configuration
 version = "0.3.2"
 edition = "2024"
-description = "A Clash/sing-box TUI application"
+rust-version = "1.89"
+description = "A Mihomo TUI application"
 license = "MIT OR Apache-2.0"
-keywords = ["tui", "clash", "mihomo", "sing-box", "terminal"]
+keywords = ["tui", "clash", "mihomo", "terminal"]
 categories = ["command-line-utilities", "terminal"]
 readme = "README.md"
 homepage = "https://github.com/JohanChane/clashtui"
@@ -35,6 +36,11 @@ minreq = { version = "2.12.0", features = [
 strum = { version = "0.28.0", features = ["derive"] }
 fastrand = "2.3.0"
 md5 = "0.8"
+tiny_http = "0.12"
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 
 # CLI
 clap = { version = "4.5.17", features = ["derive"] }
@@ -50,7 +56,7 @@ tokio = { version = "1.48.0", features = [
     "macros",
     "sync",
     "time",
-], optional = true }
+ ] }
 crossterm = { version = "*", features = [
     "event-stream",
     "serde",
@@ -62,7 +68,8 @@ futures-lite = { version = "2.6.0", default-features = false, optional = true }
 
 unicode-width = { version = "0.2.0", default-features = false }
 nix = { version = "0", features = ["user", "fs"] }
-tungstenite = { version = "0.29", default-features = false, features = ["handshake", "url"], optional = true }
+tungstenite = { version = "0.29", default-features = false, features = ["handshake", "url", "rustls-tls-native-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -79,7 +86,7 @@ windows = { version = "0.62", features = [
 
 [features]
 customized-theme = ["tui", "ratatui/serde"]
-tui = ["dep:ratatui", "dep:crossterm", "dep:tokio", "dep:futures-lite", "dep:signal-hook-tokio", "dep:tungstenite"]
+tui = ["dep:ratatui", "dep:crossterm", "dep:futures-lite", "dep:signal-hook-tokio"]
 
 default = ["customized-theme"]
 

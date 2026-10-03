@@ -2,13 +2,13 @@
 .SYNOPSIS
     ClashTui install script for Windows
 .DESCRIPTION
-    Downloads and installs clashtui binaries, core binaries (mihomo, sing-box),
+    Downloads and installs clashtui and Mihomo binaries,
     and default configuration files on Windows. Does NOT manage Windows services
     (use ClashTui's CoreSrvCtl for that).
 .PARAMETER InstallDir
     Installation directory for binaries (default: D:\ClashTui)
 .PARAMETER Core
-    Core type to install: mihomo, sing-box, or all (default: all)
+    Compatibility option: mihomo (the only supported core)
 .PARAMETER Repo
     GitHub repository for clashtui and contrib (default: JohanChane/clashtui)
 .PARAMETER Branch
@@ -22,8 +22,8 @@
 [CmdletBinding()]
 param(
     [string]$InstallDir = "D:\ClashTui",
-    [ValidateSet("mihomo", "sing-box", "all")]
-    [string]$Core = "all",
+    [ValidateSet("mihomo")]
+    [string]$Core = "mihomo",
     [string]$Repo = "JohanChane/clashtui",
     [string]$Branch = "main",
     [switch]$NoPrompt
@@ -33,7 +33,6 @@ $ErrorActionPreference = "Stop"
 
 # --- Constants ---
 $MIHOMO_UPSTREAM = "MetaCubeX/mihomo"
-$SINGBOX_UPSTREAM = "SagerNet/sing-box"
 
 # --- Logging ---
 function Write-Info {
@@ -114,14 +113,11 @@ function Get-OS {
 function Resolve-Paths {
     $script:INSTALL_DIR = $InstallDir
     $script:INSTALL_DIR_MIHOMO = Join-Path $InstallDir "mihomo"
-    $script:INSTALL_DIR_SINGBOX = Join-Path $InstallDir "sing-box"
     $script:MIHOMO_CONFIG_DIR = Join-Path $INSTALL_DIR_MIHOMO "config"
-    $script:SINGBOX_CONFIG_DIR = Join-Path $INSTALL_DIR_SINGBOX "config"
     $script:INSTALL_BIN = Join-Path $InstallDir "bin"
 
     $script:CLASHTUI_CONFIG_DIR = Join-Path $env:APPDATA "clashtui"
     $script:MIHOMO_USER_CONFIG_DIR = Join-Path $CLASHTUI_CONFIG_DIR "mihomo"
-    $script:SINGBOX_USER_CONFIG_DIR = Join-Path $CLASHTUI_CONFIG_DIR "sing-box"
 
     $script:SCRIPT_DIR = if ($MyInvocation.ScriptName) { Split-Path $MyInvocation.ScriptName -Parent } else { Get-Location }
     $contribLocal = Join-Path $SCRIPT_DIR "contrib"
@@ -294,73 +290,6 @@ function Install-Mihomo {
     }
 }
 
-function Install-SingBox {
-    $destDir = $INSTALL_DIR_SINGBOX
-    $destExe = Join-Path $destDir "sing-box.exe"
-    Write-Info "Installing sing-box..."
-
-    # Already installed at destination — skip
-    if (Test-Path $destExe) {
-        Write-Info "sing-box already exists at $destExe, skipping"
-        return
-    }
-
-    # Found in PATH — copy
-    $existing = Resolve-BinaryPath "sing-box.exe"
-    if ($existing) {
-        Write-Info "Found sing-box in PATH: $existing, copying..."
-        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-        Copy-Item $existing $destExe -Force
-        Write-Info "Copied sing-box to: $destExe"
-        return
-    }
-
-    # Not found — download
-    $arch = Get-Architecture
-    $os = Get-OS
-
-    if ($arch -eq "unsupported" -or $os -eq "unsupported") {
-        Write-ErrorLog "Unsupported architecture or OS"
-        exit 1
-    }
-
-    $release = Get-LatestGithubRelease $SINGBOX_UPSTREAM
-    $version = $release.tag_name
-    $assetUrl = Find-AssetUrl $release @(
-        "*windows*amd64*",
-        "*windows*x86_64*"
-    )
-
-    if (-not $assetUrl) {
-        Write-ErrorLog "Could not find sing-box release asset for Windows amd64"
-        exit 1
-    }
-
-    Write-Info "Detected: OS=$os, Arch=$arch, Version=$version"
-    Write-Info "Downloading: $assetUrl"
-
-    $tempDir = Join-Path $env:TEMP "clashtui_singbox_$(Get-Random)"
-    New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-    $zipPath = Join-Path $tempDir "sing-box.zip"
-
-    try {
-        Invoke-WebRequest -Uri $assetUrl -OutFile $zipPath -UseBasicParsing
-        Expand-Archive -Path $zipPath -DestinationPath $tempDir -Force
-
-        $binary = Get-ChildItem -Path $tempDir -Recurse -Filter "*sing-box*.exe" -Name | Select-Object -First 1
-        if (-not $binary) {
-            Write-ErrorLog "Could not find sing-box.exe in the downloaded archive"
-            exit 1
-        }
-        $binaryPath = Join-Path $tempDir $binary
-
-        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-        Copy-Item $binaryPath $destExe -Force
-        Write-Info "Successfully installed sing-box to: $destExe"
-    } finally {
-        Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
 
 function Install-ClashTui {
     param([string]$CoreType)
@@ -449,9 +378,7 @@ function New-ClashTuiConfig {
     $configPath = Join-Path $CLASHTUI_CONFIG_DIR "config.yaml"
 
     $mihomoBinDir = ($INSTALL_DIR_MIHOMO -replace '\\', '/')
-    $singboxBinDir = ($INSTALL_DIR_SINGBOX -replace '\\', '/')
     $mihomoCfgDir = ($MIHOMO_CONFIG_DIR -replace '\\', '/')
-    $singboxCfgDir = ($SINGBOX_CONFIG_DIR -replace '\\', '/')
 
     $configContent = @"
 mihomo:
@@ -461,14 +388,6 @@ mihomo:
     config_path: ${mihomoCfgDir}/config.yaml
   core_service:
     service_name: clashtui_mihomo
-    is_user: false
-singbox:
-  core:
-    bin_path: ${singboxBinDir}/sing-box.exe
-    config_dir: ${singboxCfgDir}
-    config_path: ${singboxCfgDir}/config.json
-  core_service:
-    service_name: clashtui_singbox
     is_user: false
 timeout:
 extra:
@@ -500,7 +419,7 @@ extra:
 #     pvd1: "https://example.com/sub2.yaml"
 '@
 
-    if ($CoreType -eq "mihomo" -or $CoreType -eq "all") {
+    if ($CoreType -eq "mihomo") {
         New-Item -ItemType Directory -Path $MIHOMO_USER_CONFIG_DIR -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $MIHOMO_USER_CONFIG_DIR "profiles") -Force | Out-Null
         New-Item -ItemType Directory -Path (Join-Path $MIHOMO_USER_CONFIG_DIR "templates") -Force | Out-Null
@@ -511,16 +430,6 @@ extra:
         }
     }
 
-    if ($CoreType -eq "sing-box" -or $CoreType -eq "all") {
-        New-Item -ItemType Directory -Path $SINGBOX_USER_CONFIG_DIR -Force | Out-Null
-        New-Item -ItemType Directory -Path (Join-Path $SINGBOX_USER_CONFIG_DIR "profiles") -Force | Out-Null
-        New-Item -ItemType Directory -Path (Join-Path $SINGBOX_USER_CONFIG_DIR "templates") -Force | Out-Null
-
-        $tppPath = Join-Path $SINGBOX_USER_CONFIG_DIR "template_proxy_providers.yaml"
-        if (-not (Test-Path $tppPath)) {
-            [System.IO.File]::WriteAllText($tppPath, $tppContent, $utf8NoBom)
-        }
-    }
 }
 
 # --- Core config creation ---
@@ -528,7 +437,7 @@ function New-CoreConfigs {
     param([string]$CoreType)
     Write-Info "Creating core config files..."
 
-    if ($CoreType -eq "mihomo" -or $CoreType -eq "all") {
+    if ($CoreType -eq "mihomo") {
         New-Item -ItemType Directory -Path $MIHOMO_CONFIG_DIR -Force | Out-Null
 
         $cfgSrc = "default_configs/mihomo/core_override_config.yaml"
@@ -541,18 +450,6 @@ function New-CoreConfigs {
         Write-Info "Mihomo core override written to: $MIHOMO_USER_CONFIG_DIR/core_override_config.yaml"
     }
 
-    if ($CoreType -eq "sing-box" -or $CoreType -eq "all") {
-        New-Item -ItemType Directory -Path $SINGBOX_CONFIG_DIR -Force | Out-Null
-
-        $cfgSrc = "default_configs/sing-box/core_override_config.json"
-        Backup-File (Join-Path $SINGBOX_CONFIG_DIR "config.json")
-        Copy-Contrib $cfgSrc (Join-Path $SINGBOX_CONFIG_DIR "config.json")
-        Write-Info "Sing-box core config written to: $SINGBOX_CONFIG_DIR/config.json"
-
-        New-Item -ItemType Directory -Path $SINGBOX_USER_CONFIG_DIR -Force | Out-Null
-        Copy-Contrib $cfgSrc (Join-Path $SINGBOX_USER_CONFIG_DIR "core_override_config.json")
-        Write-Info "Sing-box core override written to: $SINGBOX_USER_CONFIG_DIR/core_override_config.json"
-    }
 }
 
 # --- Optional downloads ---
@@ -561,7 +458,7 @@ function Invoke-OptionalDownloads {
         Write-Info "--no-prompt: downloading all optional items"
     }
 
-    if ($Core -eq "mihomo" -or $Core -eq "all") {
+    if ($Core -eq "mihomo") {
         if ($NoPrompt) {
             $dlTpl = $true
             $dlDat = $true
@@ -588,20 +485,6 @@ function Invoke-OptionalDownloads {
         }
     }
 
-    if ($Core -eq "sing-box" -or $Core -eq "all") {
-        if ($NoPrompt) {
-            $dlSbtpl = $true
-        } else {
-            $response = Read-Host "Do you want to download templates for sing-box? (y/N)"
-            $dlSbtpl = ($response -eq "y" -or $response -eq "Y")
-        }
-
-        if ($dlSbtpl) {
-            Write-Info "Downloading sing-box templates..."
-            Copy-Contrib "templates/sing-box/v1.12-tun_common_tpl.json" (Join-Path $SINGBOX_USER_CONFIG_DIR "templates/v1.12-tun_common_tpl.json")
-            Copy-Contrib "templates/sing-box/v1.12-tun_bypass.json" (Join-Path $SINGBOX_USER_CONFIG_DIR "templates/v1.12-tun_bypass.json")
-        }
-    }
 }
 
 # --- Main ---
@@ -620,19 +503,14 @@ function Main {
     Write-Info "Branch: $Branch"
 
     # Create necessary directories
-    if ($Core -eq "mihomo" -or $Core -eq "all") {
+    if ($Core -eq "mihomo") {
         New-Item -ItemType Directory -Path $MIHOMO_CONFIG_DIR -Force | Out-Null
-    }
-    if ($Core -eq "sing-box" -or $Core -eq "all") {
-        New-Item -ItemType Directory -Path $SINGBOX_CONFIG_DIR -Force | Out-Null
     }
     New-Item -ItemType Directory -Path $CLASHTUI_CONFIG_DIR -Force | Out-Null
 
     # Install cores
     switch ($Core) {
         "mihomo"   { Install-Mihomo }
-        "sing-box" { Install-SingBox }
-        "all"      { Install-Mihomo; Install-SingBox }
     }
 
     # Install clashtui (binary + config)

@@ -13,7 +13,11 @@ use super::dev::*;
 /// apply to Self
 macro_rules! sync {
     ($ident: ty) => {{
-        let (name, atime) = super::profile::get_profiles_with_readable_atime();
+        let (name, atime) = crate::functions::restful::session::spawn_blocking(
+            super::profile::get_profiles_with_readable_atime,
+        )
+        .await
+        .unwrap();
         wrapper(|(content, _): &mut $ident| super::profile::sync_helper(content, name, atime))
     }};
 }

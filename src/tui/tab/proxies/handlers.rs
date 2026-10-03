@@ -20,7 +20,7 @@ impl Proxies {
         let names: Vec<String> = items.iter().map(|(name, _)| name.clone()).collect();
         let prompt = prompt.to_owned();
         async move {
-            let selected = tokio::task::spawn_blocking(move || {
+            let selected = crate::functions::restful::session::spawn_blocking(move || {
                 crate::tui::widget::fzffind::run_fzf(&names, &prompt)
             })
             .await
@@ -42,21 +42,31 @@ impl Proxies {
         self.testing_since = Some(Instant::now());
         async move {
             tri!(
-                tokio::task::spawn_blocking(move || { proxies::select_proxy(&group, &node) })
-                    .await
-                    .unwrap(),
+                crate::functions::restful::session::spawn_blocking(move || {
+                    proxies::select_proxy(&group, &node)
+                })
+                .await
+                .unwrap(),
                 or_cancel
             );
             let response = match tokio::time::timeout(
                 Duration::from_secs(t_secs),
-                tokio::task::spawn_blocking(proxies::fetch_proxies),
+                crate::functions::restful::session::spawn_blocking(proxies::fetch_proxies),
             )
             .await
             {
                 Ok(Ok(Ok(r))) => r,
-                _ => {
+                result => {
+                    let detail = match result {
+                        Ok(Ok(Err(error))) => error.to_string(),
+                        Ok(Err(error)) => error.to_string(),
+                        Err(error) => error.to_string(),
+                        Ok(Ok(Ok(_))) => unreachable!(),
+                    };
                     return wrapper(move |content: &mut Self| {
-                        content.error = None;
+                        content.error = Some(format!(
+                            "Proxy selection was accepted, but state readback failed: {detail}"
+                        ));
                         content.testing_since = None;
                     });
                 }
@@ -84,7 +94,7 @@ impl Proxies {
                 async move {
                     let delays = match tokio::time::timeout(
                         Duration::from_secs(t_secs),
-                        tokio::task::spawn_blocking(move || {
+                        crate::functions::restful::session::spawn_blocking(move || {
                             proxies::test_group_delay(&n, test_url.as_deref(), timeout)
                         }),
                     )
@@ -106,7 +116,7 @@ impl Proxies {
                     };
                     let mut response = match tokio::time::timeout(
                         Duration::from_secs(t_secs),
-                        tokio::task::spawn_blocking(proxies::fetch_proxies),
+                        crate::functions::restful::session::spawn_blocking(proxies::fetch_proxies),
                     )
                     .await
                     {
@@ -139,12 +149,24 @@ impl Proxies {
                 self.error = Some(format!("Testing {name}..."));
                 self.testing_since = Some(Instant::now());
                 let n = name.clone();
+                let provider = self
+                    .proxies
+                    .get(&name)
+                    .and_then(|proxy| proxy.provider_name.clone());
                 async move {
                     let delay = match tokio::time::timeout(
                         Duration::from_secs(t_secs),
-                        tokio::task::spawn_blocking(move || {
-                            proxies::test_proxy_delay(&n, test_url.as_deref(), timeout)
-                        }),
+                        crate::functions::restful::session::spawn_blocking(
+                            move || match provider {
+                                Some(provider) => proxies::test_provider_node_delay(
+                                    &provider,
+                                    &n,
+                                    test_url.as_deref(),
+                                    timeout,
+                                ),
+                                None => proxies::test_proxy_delay(&n, test_url.as_deref(), timeout),
+                            },
+                        ),
                     )
                     .await
                     {
@@ -165,7 +187,7 @@ impl Proxies {
                     };
                     let mut response = match tokio::time::timeout(
                         Duration::from_secs(t_secs),
-                        tokio::task::spawn_blocking(proxies::fetch_proxies),
+                        crate::functions::restful::session::spawn_blocking(proxies::fetch_proxies),
                     )
                     .await
                     {
@@ -228,7 +250,7 @@ impl Proxies {
                 let n = name.clone();
                 if let Ok(Ok(Ok(delays))) = tokio::time::timeout(
                     Duration::from_secs(t_secs),
-                    tokio::task::spawn_blocking(move || {
+                    crate::functions::restful::session::spawn_blocking(move || {
                         proxies::test_group_delay(&n, url.as_deref(), timeout)
                     }),
                 )
@@ -244,7 +266,7 @@ impl Proxies {
                 let n = name.clone();
                 match tokio::time::timeout(
                     Duration::from_secs(t_secs),
-                    tokio::task::spawn_blocking(move || {
+                    crate::functions::restful::session::spawn_blocking(move || {
                         proxies::test_proxy_delay(&n, url.as_deref(), timeout)
                     }),
                 )
@@ -258,7 +280,7 @@ impl Proxies {
             }
             let mut response = match tokio::time::timeout(
                 Duration::from_secs(t_secs),
-                tokio::task::spawn_blocking(proxies::fetch_proxies),
+                crate::functions::restful::session::spawn_blocking(proxies::fetch_proxies),
             )
             .await
             {
@@ -290,7 +312,7 @@ impl Proxies {
     pub fn refresh(&mut self, task_set: &mut FutureSet<Self>) {
         async {
             let response = tri!(
-                tokio::task::spawn_blocking(proxies::fetch_proxies)
+                crate::functions::restful::session::spawn_blocking(proxies::fetch_proxies)
                     .await
                     .unwrap(),
                 or_set

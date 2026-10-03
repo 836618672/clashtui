@@ -115,22 +115,11 @@ pub fn nssm_status(service_name: &str) -> String {
 
 /// Build nssm launch args for the current core type.
 /// mihomo: `-d <config_dir>`
-/// sing-box: `-D <config_dir> -c <config_path> run`
 pub fn nssm_launch_args(ct: CoreType) -> Vec<String> {
     match ct {
         CoreType::Mihomo => {
             let cfg = &CONFIG.cfg_file.mihomo.core;
             vec!["-d".to_owned(), cfg.config_dir.clone()]
-        }
-        CoreType::Singbox => {
-            let cfg = &CONFIG.cfg_file.singbox.core;
-            vec![
-                "-D".to_owned(),
-                cfg.config_dir.clone(),
-                "-c".to_owned(),
-                cfg.config_path.clone(),
-                "run".to_owned(),
-            ]
         }
     }
 }
@@ -314,14 +303,10 @@ fn broadcast_settings_change() {
 
 /// Retrieve the mixed inbound port from the core REST API (`GET /configs`).
 pub fn get_mixed_port() -> Result<u16> {
-    use crate::functions::restful::config_struct::ClashConfig;
-    let resp = minreq::get(format!("{}/configs", CONFIG.controller_for_core()))
-        .with_timeout(5)
-        .send()
-        .map_err(|e| anyhow::anyhow!("Failed to fetch /configs: {e}"))?;
-    let cfg: ClashConfig = serde_json::from_str(resp.as_str().map_err(|e| anyhow::anyhow!("{e}"))?)
-        .map_err(|e| anyhow::anyhow!("Failed to parse /configs: {e}"))?;
+    let cfg = crate::functions::restful::config::fetch()?;
     cfg.mixed_port
+        .filter(|port| *port > 0)
         .or(cfg.port)
+        .filter(|port| *port > 0)
         .ok_or_else(|| anyhow::anyhow!("No mixed_port or port found in /configs"))
 }

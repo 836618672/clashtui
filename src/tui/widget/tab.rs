@@ -80,8 +80,11 @@ where
 
     fn sync(&mut self) {
         while let Some(f) = self.tasks.try_join_next() {
-            // SAFETY: panic happens only when a task is canceled(not gonna to happen) or paniced
-            f.unwrap()(&mut self.content);
+            match f {
+                Ok(callback) => callback(&mut self.content),
+                Err(error) if error.is_cancelled() => continue,
+                Err(error) => log::error!("Tab task failed: {error}"),
+            }
             self.content.after_sync(&mut self.tasks);
         }
     }
@@ -149,7 +152,12 @@ impl<C: TabContent> Tab<C> {
 /// task_set.spawn(task);
 /// ```
 pub fn wrapper<C>(f: impl FnOnce(&mut C) + 'static + Send) -> CallBack<C> {
-    Box::new(f)
+    let session = crate::functions::restful::session::CoreSession::try_current();
+    Box::new(move |content| {
+        if session.is_none_or(|session| session.is_current()) {
+            f(content);
+        }
+    })
 }
 
 pub fn do_nothing<C>() -> CallBack<C> {
@@ -162,7 +170,12 @@ where
     C: 'static,
 {
     fn spawn_at(self, set: &mut FutureSet<C>) {
-        set.spawn(self);
+        use crate::functions::restful::session::{CoreSession, TASK_SESSION};
+        if let Some(session) = CoreSession::try_current() {
+            set.spawn(TASK_SESSION.scope(session, self));
+        } else {
+            set.spawn(self);
+        }
     }
 }
 impl<F, C> FutureSetExt<C> for F

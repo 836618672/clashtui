@@ -53,6 +53,8 @@ where
     is_focus_on_c1: bool,
     c1_shortcuts: Vec<(KeyCombo, &'static str)>,
     c2_shortcuts: Vec<(KeyCombo, &'static str)>,
+    active: bool,
+    last_refresh: std::time::Instant,
 }
 
 impl<C1, C2> Default for DualTab<C1, C2>
@@ -83,6 +85,8 @@ where
             is_focus_on_c1: true,
             c1_shortcuts,
             c2_shortcuts,
+            active: false,
+            last_refresh: std::time::Instant::now(),
         }
     }
 }
@@ -197,7 +201,29 @@ where
 
     fn sync(&mut self) {
         while let Some(f) = self.tasks.try_join_next() {
-            f.unwrap()(&mut self.content)
+            match f {
+                Ok(callback) => callback(&mut self.content),
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => log::error!("File task failed: {error}"),
+            }
         }
+        if self.active
+            && self.tasks.is_empty()
+            && self.last_refresh.elapsed() >= std::time::Duration::from_secs(2)
+        {
+            C1::init(&mut self.content.0, &mut self.tasks, &mut self.state.0);
+            C2::init(&mut self.content.1, &mut self.tasks, &mut self.state.1);
+            self.last_refresh = std::time::Instant::now();
+        }
+    }
+
+    fn on_enter(&mut self) {
+        self.active = true;
+        self.last_refresh = std::time::Instant::now();
+        C1::init(&mut self.content.0, &mut self.tasks, &mut self.state.0);
+        C2::init(&mut self.content.1, &mut self.tasks, &mut self.state.1);
+    }
+    fn on_leave(&mut self) {
+        self.active = false;
     }
 }

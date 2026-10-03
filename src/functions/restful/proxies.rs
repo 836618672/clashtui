@@ -5,6 +5,31 @@ use std::collections::HashMap;
 
 const DEFAULT_TEST_URL: &str = "https://www.gstatic.com/generate_204";
 
+fn delay_http_timeout(timeout_ms: u64) -> Result<u64> {
+    if !(1..=3_600_000).contains(&timeout_ms) {
+        return Err(minreq::Error::IoError(std::io::Error::other(
+            "Use a delay timeout between 1 and 3600000 milliseconds",
+        )));
+    }
+    // Match the locked Web panel's budget plus ten seconds of round-trip margin.
+    Ok((timeout_ms + 10_000).max(20_000).div_ceil(1000))
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::delay_http_timeout;
+
+    #[test]
+    fn delay_budget_has_margin_rounds_up_and_rejects_invalid_limits() {
+        assert_eq!(delay_http_timeout(5000).unwrap(), 20);
+        assert_eq!(delay_http_timeout(25_001).unwrap(), 36);
+        assert_eq!(delay_http_timeout(3_600_000).unwrap(), 3610);
+        assert!(delay_http_timeout(0).is_err());
+        assert!(delay_http_timeout(3_600_001).is_err());
+        assert!(delay_http_timeout(u64::MAX).is_err());
+    }
+}
+
 fn encode_path(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -19,16 +44,9 @@ fn encode_path(s: &str) -> String {
 fn encode_query(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z'
-            | b'a'..=b'z'
-            | b'0'..=b'9'
-            | b'-'
-            | b'_'
-            | b'.'
-            | b'~'
-            | b':'
-            | b'/'
-            | b'%' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
             _ => format!("%{:02X}", b),
         })
         .collect::<String>()
@@ -138,14 +156,53 @@ pub fn test_proxy_delay(name: &str, url: Option<&str>, timeout: u64) -> Result<O
         "/proxies/{name_enc}/delay?url={}&timeout={timeout}",
         encode_query(test_url)
     );
-    request(Method::Get, &endpoint, None).and_then(|r| {
-        let v: serde_json::Value = r.json()?;
-        let delay = v.get("delay").and_then(|d| {
-            d.as_u64()
-                .or_else(|| d.as_str().and_then(|s| s.parse().ok()))
-        });
-        Ok(delay.filter(|&d| d > 0))
-    })
+    session::CoreSession::current()
+        .request_with_timeout(Method::Get, &endpoint, None, delay_http_timeout(timeout)?)
+        .and_then(|r| {
+            let v: serde_json::Value = r.json()?;
+            let delay = v.get("delay").and_then(|d| {
+                d.as_u64()
+                    .or_else(|| d.as_str().and_then(|s| s.parse().ok()))
+            });
+            Ok(delay.filter(|&d| d > 0))
+        })
+}
+
+pub fn unfix_proxy(group: &str) -> anyhow::Result<()> {
+    let value: serde_json::Value = request(Method::Get, "/proxies", None)?.json()?;
+    anyhow::ensure!(
+        value["proxies"][group]["fixed"]
+            .as_str()
+            .is_some_and(|fixed| !fixed.is_empty()),
+        "Group has no fixed selection to clear"
+    );
+    request(
+        Method::Delete,
+        &format!("/proxies/{}", encode_path(group)),
+        None,
+    )?;
+    Ok(())
+}
+
+pub fn test_provider_node_delay(
+    provider: &str,
+    name: &str,
+    url: Option<&str>,
+    timeout: u64,
+) -> Result<Option<u64>> {
+    let endpoint = format!(
+        "/providers/proxies/{}/{}/healthcheck?url={}&timeout={timeout}",
+        encode_path(provider),
+        encode_path(name),
+        encode_query(url.unwrap_or(DEFAULT_TEST_URL))
+    );
+    let value: serde_json::Value = session::CoreSession::current()
+        .request_with_timeout(Method::Get, &endpoint, None, delay_http_timeout(timeout)?)?
+        .json()?;
+    Ok(value["delay"]
+        .as_u64()
+        .or_else(|| value["delay"].as_str().and_then(|delay| delay.parse().ok()))
+        .filter(|delay| *delay > 0))
 }
 
 pub fn test_group_delay(
@@ -159,25 +216,27 @@ pub fn test_group_delay(
         "/group/{name_enc}/delay?url={}&timeout={timeout}",
         encode_query(test_url)
     );
-    request(Method::Get, &endpoint, None).and_then(|r| {
-        let v: serde_json::Value = r.json()?;
-        let map = v
-            .as_object()
-            .map(|obj| {
-                obj.iter()
-                    .filter_map(|(k, v)| {
-                        let delay = v
-                            .as_u64()
-                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))?;
-                        if delay > 0 {
-                            Some((k.clone(), delay))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(map)
-    })
+    session::CoreSession::current()
+        .request_with_timeout(Method::Get, &endpoint, None, delay_http_timeout(timeout)?)
+        .and_then(|r| {
+            let v: serde_json::Value = r.json()?;
+            let map = v
+                .as_object()
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(k, v)| {
+                            let delay = v
+                                .as_u64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))?;
+                            if delay > 0 {
+                                Some((k.clone(), delay))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Ok(map)
+        })
 }

@@ -43,7 +43,6 @@ pub fn migrate() -> anyhow::Result<()> {
                 is_user,
             },
         },
-        singbox: super::core::SingboxSection::default(),
         timeout,
         extra: super::core::Extra {
             edit_cmd: (!edit_cmd.is_empty()).then_some(edit_cmd),

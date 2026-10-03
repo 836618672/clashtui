@@ -12,24 +12,7 @@ use std::{path::Path, process::Command};
 pub use platform::*;
 use utils::*;
 
-pub fn test_config(profile_path: Option<&Path>, enable_geodata_mode: bool) -> String {
-    let cfg = &CONFIG.cfg_file.mihomo.core;
-
-    let mut cmd = Command::new(&cfg.bin_path);
-    cmd.args(["-t", "-d", &cfg.config_dir, "-f"]);
-    if let Some(path) = profile_path {
-        cmd.arg(path);
-    } else {
-        cmd.arg(&cfg.config_path);
-    }
-
-    if enable_geodata_mode {
-        cmd.arg("-m");
-    }
-
-    let opt = cmd.output().unwrap();
-    stringify_output(opt)
-}
+thread_local! { pub static BACKGROUND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 pub fn check_config(profile_path: &Path) -> anyhow::Result<()> {
     match CONFIG.core_type() {
@@ -49,69 +32,31 @@ pub fn check_config(profile_path: &Path) -> anyhow::Result<()> {
                 ))
             }
         }
-        CoreType::Singbox => {
-            let cfg = &CONFIG.cfg_file.singbox.core;
-            // Strip clashtui metadata before check — sing-box rejects unknown fields
-            let check_path = if let Ok(content) = std::fs::read_to_string(profile_path) {
-                if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if value
-                        .as_object_mut()
-                        .is_some_and(|obj| obj.remove("clashtui").is_some())
-                    {
-                        let tmp = profile_path.with_file_name(format!(
-                            "{}.raw.json",
-                            profile_path
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or("tmp")
-                        ));
-                        let _ = std::fs::write(
-                            &tmp,
-                            serde_json::to_string_pretty(&value).unwrap_or_default(),
-                        );
-                        tmp
-                    } else {
-                        profile_path.to_path_buf()
-                    }
-                } else {
-                    profile_path.to_path_buf()
-                }
-            } else {
-                profile_path.to_path_buf()
-            };
-            let output = Command::new(&cfg.bin_path)
-                .args(["check", "-D", &cfg.config_dir, "-c"])
-                .arg(&check_path)
-                .output()
-                .map_err(|e| anyhow::anyhow!("Failed to run sing-box check: {e}"))?;
-            // Clean up temp file
-            if check_path != profile_path {
-                let _ = std::fs::remove_file(&check_path);
-            }
-            if output.status.success() {
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!(
-                    "sing-box check failed:\n{}",
-                    stringify_output(output)
-                ))
-            }
-        }
     }
 }
 
+/// Preserve the core's diagnostic output for all three clients.
+pub fn configuration_test(profile_path: &Path) -> anyhow::Result<serde_json::Value> {
+    let cfg = &CONFIG.cfg_file.mihomo.core;
+    let output = Command::new(&cfg.bin_path)
+        .args(["-t", "-d", &cfg.config_dir, "-f"])
+        .arg(profile_path)
+        .output()?;
+    Ok(
+        serde_json::json!({"valid":output.status.success(),"exit_code":output.status.code(),"stdout":String::from_utf8_lossy(&output.stdout),"stderr":String::from_utf8_lossy(&output.stderr),"activated":false}),
+    )
+}
+
 pub fn is_core_service_running() -> Option<bool> {
-    let ct = CONFIG.core_type();
+    core_service_running(CONFIG.core_type())
+}
+
+fn core_service_running(ct: CoreType) -> Option<bool> {
     let (service_name, is_user, csc) = match ct {
         CoreType::Mihomo => (
             &CONFIG.cfg_file.mihomo.core_service.service_name,
             CONFIG.cfg_file.mihomo.core_service.is_user,
             &CONFIG.cfg_file.mihomo.core_service,
-        ),
-        CoreType::Singbox => (
-            &CONFIG.cfg_file.singbox.core_service.service_name,
-            CONFIG.cfg_file.singbox.core_service.is_user,
-            &CONFIG.cfg_file.singbox.core_service,
         ),
     };
     let host = &ServiceController::from_config(csc);
@@ -167,18 +112,21 @@ pub fn is_core_service_running() -> Option<bool> {
 }
 
 fn svc_operation(op: &str, core_type: Option<CoreType>) -> Result<String> {
+    let _write = crate::functions::file::coordination::WriteGuard::acquire()?;
     let ct = core_type.unwrap_or(CONFIG.core_type());
+    let controller = match ct {
+        CoreType::Mihomo => &CONFIG.external_controller,
+    };
+    anyhow::ensure!(
+        crate::functions::management::local_controller(controller),
+        "Remote core endpoints cannot control local services"
+    );
 
     let (service_name, is_user, csc) = match ct {
         CoreType::Mihomo => (
             &CONFIG.cfg_file.mihomo.core_service.service_name,
             CONFIG.cfg_file.mihomo.core_service.is_user,
             &CONFIG.cfg_file.mihomo.core_service,
-        ),
-        CoreType::Singbox => (
-            &CONFIG.cfg_file.singbox.core_service.service_name,
-            CONFIG.cfg_file.singbox.core_service.is_user,
-            &CONFIG.cfg_file.singbox.core_service,
         ),
     };
     let host = &ServiceController::from_config(csc);
@@ -211,7 +159,6 @@ fn nssm_svc_operation(op: &str, service_name: &str, ct: CoreType) -> Result<Stri
         "install" => {
             let bin_path = match ct {
                 CoreType::Mihomo => &CONFIG.cfg_file.mihomo.core.bin_path,
-                CoreType::Singbox => &CONFIG.cfg_file.singbox.core.bin_path,
             };
             let launch_args = platform::nssm_launch_args(ct);
             let launch_strs: Vec<&str> = launch_args.iter().map(|s| s.as_str()).collect();
@@ -259,7 +206,10 @@ pub fn stop_core_service(core_type: CoreType) -> Result<String> {
 }
 
 pub fn start_core_service(core_type: CoreType) -> Result<String> {
-    svc_operation("start", Some(core_type))
+    let output = svc_operation("start", Some(core_type))?;
+    crate::functions::restful::config::wait_until_ready()
+        .map_err(|error| anyhow::anyhow!("Service start was accepted, but Mihomo is not ready: {error}. Check service status before retrying."))?;
+    Ok(output)
 }
 
 #[cfg(windows)]
@@ -273,7 +223,10 @@ pub fn uninstall_core_service(core_type: CoreType) -> Result<String> {
 }
 
 pub fn restart_service() -> Result<String> {
-    svc_operation("restart", None)
+    let output = svc_operation("restart", None)?;
+    crate::functions::restful::config::wait_until_ready()
+        .map_err(|error| anyhow::anyhow!("Service restart was accepted, but Mihomo is not ready: {error}. Check service status before retrying."))?;
+    Ok(output)
 }
 
 pub fn stop_service() -> Result<String> {
@@ -282,21 +235,37 @@ pub fn stop_service() -> Result<String> {
 
 pub fn stop_all_services() -> Result<String> {
     let mut outputs = Vec::new();
-    let core_types = [CoreType::Mihomo, CoreType::Singbox];
+    let mut failures = Vec::new();
+    let core_types = [CoreType::Mihomo];
     for ct in &core_types {
+        if core_service_running(*ct) == Some(false) {
+            outputs.push(format!("{ct}: already stopped"));
+            continue;
+        }
         match stop_core_service(*ct) {
             Ok(out) => outputs.push(out),
             Err(e) => {
                 log::warn!("Failed to stop {:?} service: {e}", ct);
+                failures.push(format!("{ct}: {e}"));
             }
         }
     }
+    anyhow::ensure!(
+        failures.is_empty(),
+        "Some services could not be stopped: {}",
+        failures.join("; ")
+    );
     Ok(outputs.join("\n"))
 }
 
 pub fn edit(path: &str) -> Result<()> {
     let tpl = CONFIG.cfg_file.extra.edit_cmd.as_deref().unwrap_or("");
     log::debug!("edit: path={path} template={tpl}");
+    #[cfg(all(unix, feature = "tui"))]
+    if !tpl.is_empty() && crate::tui::is_active() && !BACKGROUND.with(|background| background.get())
+    {
+        return edit_terminal(tpl, path);
+    }
     shell_spawn(tpl, path)
 }
 
@@ -304,6 +273,65 @@ pub fn open_dir(path: &str) -> Result<()> {
     let tpl = CONFIG.cfg_file.extra.open_dir_cmd.as_deref().unwrap_or("");
     log::debug!("open_dir: path={path} template={tpl}");
     shell_spawn(tpl, path)
+}
+
+pub fn open_panel() -> Result<()> {
+    let url = format!("{}/ui/", CONFIG.controller_for_core().trim_end_matches('/'));
+    anyhow::ensure!(
+        url.starts_with("http://") || url.starts_with("https://"),
+        "Panel endpoint must use HTTP or HTTPS"
+    );
+    #[cfg(target_os = "linux")]
+    let (bin, args) = ("xdg-open", vec![url.as_str()]);
+    #[cfg(target_os = "macos")]
+    let (bin, args) = ("open", vec![url.as_str()]);
+    #[cfg(target_os = "windows")]
+    let (bin, args) = (
+        "rundll32",
+        vec!["url.dll,FileProtocolHandler", url.as_str()],
+    );
+    Command::new(bin).args(args).spawn()?;
+    Ok(())
+}
+
+#[cfg(feature = "tui")]
+pub fn copy_text(text: &str) -> Result<()> {
+    use std::io::Write;
+    #[cfg(target_os = "linux")]
+    let candidates: &[(&str, &[&str])] =
+        &[("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
+    #[cfg(target_os = "macos")]
+    let candidates: &[(&str, &[&str])] = &[("pbcopy", &[])];
+    #[cfg(target_os = "windows")]
+    let candidates: &[(&str, &[&str])] = &[(
+        "powershell",
+        &["-NoProfile", "-Command", "$input | Set-Clipboard"],
+    )];
+    let mut failures = Vec::new();
+    for (program, args) in candidates {
+        let result = (|| -> Result<()> {
+            let mut child = Command::new(program)
+                .args(*args)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()?;
+            let write = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("Clipboard input unavailable"))?
+                .write_all(text.as_bytes());
+            let status = child.wait()?;
+            write?;
+            anyhow::ensure!(status.success(), "Clipboard command failed");
+            Ok(())
+        })();
+        if result.is_ok() {
+            return Ok(());
+        }
+        failures.push(program.to_string());
+    }
+    anyhow::bail!("Clipboard unavailable; check {}", failures.join(" or "))
 }
 
 #[cfg(test)]

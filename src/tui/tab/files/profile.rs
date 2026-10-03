@@ -1,4 +1,4 @@
-use crate::functions::command::{check_config, edit, test_config};
+use crate::functions::command::edit;
 use crate::functions::file::profile::{db, select, update_profile};
 use crate::functions::restful::download;
 use crate::tui::widget::popmsg::Confirm;
@@ -118,6 +118,11 @@ mod_agent!(
             "Preview"
         ),
         ([KeyCode::Char('u')], Key::Action(Action::Update), "Update"),
+        (
+            [KeyCode::Char('U')],
+            Key::Action(Action::UpdateAll),
+            "Update all profiles"
+        ),
         (
             [KeyCode::Char('/')],
             Key::Action(Action::Search),
@@ -368,9 +373,11 @@ impl DualTabContent for Profile {
             Key::Select => {
                 let name = get_name!(self, state);
                 async move {
-                    let pf = tri!(db::get(&name).unwrap().load_local_profile());
-                    tri!(check_config(&pf.path));
-                    tri!(select(db::get(&name).unwrap()).await);
+                    let pf =
+                        tri!(db::get(&name).ok_or_else(|| anyhow::anyhow!(
+                            "Profile was removed; refresh and retry"
+                        )));
+                    tri!(select(pf).await);
                     sync!((Self, Self::Mate))
                 }
                 .spawn_at(task_set);
@@ -587,7 +594,7 @@ mod actions {
 
     pub(super) async fn fzf_find(items: Vec<String>) -> CB {
         let fzf_items = items.clone();
-        let selected = tokio::task::spawn_blocking(move || {
+        let selected = crate::functions::restful::session::spawn_blocking(move || {
             crate::tui::widget::fzffind::run_fzf(&fzf_items, "Find Profile")
         })
         .await
@@ -631,56 +638,16 @@ mod actions {
         let source = source.trim().to_owned();
 
         let is_url = source.starts_with("http://") || source.starts_with("https://");
-        let is_singbox = crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox;
-
-        if is_singbox {
-            let content: serde_json::Value = if is_url {
-                let mut response =
-                    tri!(crate::functions::restful::download::profile(&source, false));
-                tri!(serde_json::from_reader(&mut response))
-            } else {
-                let file = tri!(std::fs::File::open(&source));
-                tri!(serde_json::from_reader(file))
-            };
-            let path = crate::functions::file::PROFILE_JSONS_PATH.join(format!("{name}.json"));
-            {
-                if let Some(parent) = path.parent() {
-                    tri!(std::fs::create_dir_all(parent));
-                }
-                tri!(std::fs::create_dir_all(
-                    &*crate::functions::file::PROFILE_JSONS_PATH
-                ));
-                let file = tri!(std::fs::File::create(&path));
-                tri!(serde_json::to_writer(file, &content));
-            }
-            {
-                let mut pm = crate::config::CONFIG.data.lock().unwrap();
-                let dtype = if is_url {
-                    crate::config::database::ProfileType::Url(source.clone())
-                } else {
-                    crate::config::database::ProfileType::Singbox
-                };
-                pm.insert(&name, dtype);
-                tri!(pm.to_file());
-            }
-        } else if is_url {
-            let path = crate::functions::file::PROFILE_YAMLS_PATH.join(format!("{name}.yaml"));
-            {
-                let mut response =
-                    tri!(crate::functions::restful::download::profile(&source, false));
-                let content: serde_yml::Mapping = tri!(serde_yml::from_reader(&mut response));
-                if let Some(parent) = path.parent() {
-                    tri!(std::fs::create_dir_all(parent));
-                }
-                let file = tri!(std::fs::File::create(&path));
-                tri!(serde_yml::to_writer(file, &content));
-            }
-            tri!(db::create(&name, source));
-        } else {
-            tri!(crate::functions::file::profile::import_profile_from_file(
-                &source, &name
-            ));
-        }
+        let import_name = name.clone();
+        let result = crate::functions::restful::session::spawn_blocking(move || -> anyhow::Result<()> {
+            let state = crate::functions::management::snapshot()?;
+            let mut request = serde_json::json!({"action": if is_url { "create" } else { "import" }, "name": import_name, "revision":state["revision"], "core":state["core"]});
+            if is_url { request["url"] = serde_json::json!(source); }
+            else { request["content"] = serde_json::json!(std::fs::read_to_string(source)?); }
+            crate::functions::management::execute(request)?;
+            Ok(())
+        }).await;
+        tri!(tri!(result));
 
         let (names, atime) = get_profiles_with_readable_atime();
         wrapper(move |(content, _): &mut C| {
@@ -767,17 +734,6 @@ mod actions {
     }
 
     async fn toggle_no_pp(name: String) -> CB {
-        {
-            let pf = tri!(db::get(&name).ok_or_else(|| anyhow::anyhow!("Profile not found")));
-            if pf.dtype == crate::config::database::ProfileType::Singbox
-                || crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox
-            {
-                Confirm::err(anyhow::anyhow!(
-                    "no_pp is not applicable for sing-box profiles (proxy-provider not supported)"
-                ));
-                return do_nothing();
-            }
-        }
         tri!(db::toggle_no_pp(&name));
 
         let (names, atime) = get_profiles_with_readable_atime();
@@ -803,7 +759,9 @@ mod actions {
             return do_nothing();
         }
 
-        let pf = db::get(name).unwrap();
+        let pf = tri!(
+            db::get(name).ok_or_else(|| anyhow::anyhow!("Profile was removed; refresh and retry"))
+        );
         tri!(db::remove(pf));
 
         sync!(C)
@@ -811,7 +769,13 @@ mod actions {
 
     async fn preview(name: String) -> CB {
         let mut lines = Vec::with_capacity(512);
-        let pf = tri!(db::get(name).unwrap().load_local_profile());
+        let pf = tri!(
+            tri!(
+                db::get(name)
+                    .ok_or_else(|| anyhow::anyhow!("Profile was removed; refresh and retry"))
+            )
+            .load_local_profile()
+        );
         lines.push(
             pf.dtype
                 .get_domain()
@@ -843,7 +807,10 @@ mod actions {
         {
             fetch_traffic_for_url(url, with_proxy);
         }
-        let result = update_profile(db::get(&name).unwrap(), with_proxy).await;
+        let result = match db::get(&name) {
+            Some(profile) => update_profile(profile, with_proxy).await,
+            None => Err(anyhow::anyhow!("Profile was removed; refresh and retry")),
+        };
 
         let (names, atime) = get_profiles_with_readable_atime();
         wrapper(move |(content, _): &mut C| {
@@ -858,7 +825,12 @@ mod actions {
                             &upd.net_updates,
                         ));
                     }
-                    Confirm::title("Updated".to_owned())
+                    let title = if upd.net_updates.iter().any(|resource| !resource.ok) {
+                        "Updated (some failed)"
+                    } else {
+                        "Updated"
+                    };
+                    Confirm::title(title.to_owned())
                         .with_prompt(msg)
                         .build_and_send();
                 }
@@ -873,12 +845,19 @@ mod actions {
             let with_proxy = db::get(name)
                 .map(|pf| pf.update_with_proxy)
                 .unwrap_or(false);
-            let result = update_profile(db::get(name).unwrap(), with_proxy).await;
+            let result = match db::get(name) {
+                Some(profile) => update_profile(profile, with_proxy).await,
+                None => Err(anyhow::anyhow!("Profile was removed; refresh and retry")),
+            };
             results.push((name.clone(), result));
         }
 
         let (new_names, new_atime) = get_profiles_with_readable_atime();
         wrapper(move |(content, _): &mut C| {
+            let has_errors = results.iter().any(|(_, result)| match result {
+                Ok(update) => update.net_updates.iter().any(|resource| !resource.ok),
+                Err(_) => true,
+            });
             let mut msgs = Vec::with_capacity(results.len());
             for (name, result) in results {
                 content.updating.remove(&name);
@@ -899,7 +878,6 @@ mod actions {
                 }
             }
             sync_helper(content, new_names, new_atime);
-            let has_errors = msgs.iter().any(|m| m.contains(':') && !m.contains(": ok"));
             let title = if has_errors {
                 "Updated (some failed)"
             } else {
@@ -971,23 +949,6 @@ mod actions {
             }
         }
 
-        let profile_json_path =
-            crate::functions::file::PROFILE_JSONS_PATH.join(format!("{name}.json"));
-        if let Ok(content) = std::fs::read_to_string(&profile_json_path)
-            && let Ok(mapping) = serde_json::from_str::<serde_json::Value>(&content)
-            && let Some(pp_map) = mapping.get("proxy-providers")
-            && let Some(obj) = pp_map.as_object()
-        {
-            for (pp_name, pp_val) in obj {
-                if let Some(pp_url) = pp_val.get("url").and_then(|v| v.as_str()) {
-                    let url = pp_url.to_string();
-                    if !pp_urls.iter().any(|(_, u)| u == &url) {
-                        pp_urls.push((pp_name.clone(), url));
-                    }
-                }
-            }
-        }
-
         for (pp_name, pp_url) in &pp_urls {
             if !urls_to_fetch.iter().any(|(_, u)| u == pp_url) {
                 urls_to_fetch.push((pp_name.clone(), pp_url.clone()));
@@ -999,12 +960,12 @@ mod actions {
             let entry_url_c = entry_url.clone();
             let entry_name_c = entry_name.clone();
             let wp = with_proxy;
-            fetch_handles.push(tokio::task::spawn_blocking(move || {
-                match download::fetch_subscription_userinfo(&entry_url_c, wp) {
+            fetch_handles.push(crate::functions::restful::session::spawn_blocking(
+                move || match download::fetch_subscription_userinfo(&entry_url_c, wp) {
                     Ok(Some(userinfo)) => Some((entry_name_c, entry_url_c, userinfo)),
                     _ => None,
-                }
-            }));
+                },
+            ));
         }
 
         for handle in fetch_handles {
@@ -1045,26 +1006,37 @@ mod actions {
         do_nothing()
     }
 
+    async fn config_diagnostics(
+        name: String,
+        action: &'static str,
+    ) -> anyhow::Result<serde_json::Value> {
+        crate::functions::restful::session::spawn_blocking(move || {
+            let state = crate::functions::management::snapshot()?;
+            crate::functions::management::execute(serde_json::json!({"action":action,"name":name,"revision":state["revision"],"core":state["core"]}))
+        }).await?
+    }
+
     async fn test(name: String) -> CB {
-        let pf = tri!(db::get(name).unwrap().load_local_profile());
-        let result = test_config(Some(&pf.path), false);
+        let result = tri!(config_diagnostics(name, "test").await);
         Confirm::title("Test Result".to_owned())
-            .with_prompt(result)
+            .with_prompt(serde_json::to_string_pretty(&result).unwrap_or_default())
             .build_and_send();
 
         do_nothing()
     }
 
     async fn check(name: String) -> CB {
-        let pf = tri!(db::get(name).unwrap().load_local_profile());
-        match check_config(&pf.path) {
-            Ok(()) => {
-                Confirm::title("Check Passed".to_owned())
-                    .with_prompt("Configuration is valid.".to_owned())
-                    .build_and_send();
+        let result = tri!(config_diagnostics(name, "check").await);
+        Confirm::title(
+            if result["valid"] == true {
+                "Check Passed"
+            } else {
+                "Check Failed"
             }
-            Err(e) => Confirm::err(e),
-        }
+            .to_owned(),
+        )
+        .with_prompt(serde_json::to_string_pretty(&result).unwrap_or_default())
+        .build_and_send();
 
         do_nothing()
     }
@@ -1090,19 +1062,20 @@ mod actions {
             }
         };
 
-        let result = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(format!("echo -n '{}' | xclip -selection clipboard 2>/dev/null || echo -n '{}' | wl-copy 2>/dev/null", url, url))
-            .output();
+        let copy = url.clone();
+        let result = crate::functions::restful::session::spawn_blocking(move || {
+            crate::functions::command::copy_text(&copy)
+        })
+        .await;
 
         match result {
-            Ok(out) if out.status.success() => {
+            Ok(Ok(())) => {
                 Confirm::title("Copied".to_owned())
                     .with_prompt(format!("URL copied to clipboard: {url}"))
                     .build_and_send();
             }
             _ => Confirm::err(anyhow::anyhow!(
-                "Failed to copy to clipboard. Install xclip or wl-copy."
+                "Failed to copy to clipboard. Check your platform clipboard utility."
             )),
         }
 
@@ -1120,11 +1093,10 @@ pub(super) fn get_profiles_with_readable_atime() -> (Vec<String>, Vec<String>) {
             let name = pf.name.clone();
             let no_pp = pf.no_pp;
             let update_with_proxy = pf.update_with_proxy;
-            let is_singbox = crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox;
             let domain = match &pf.dtype {
                 ProfileType::File => "local import".to_owned(),
                 ProfileType::Url(url) => extract_domain(url).unwrap_or("unknown").to_owned(),
-                ProfileType::Singbox => "singbox profile".to_owned(),
+
                 ProfileType::Template { .. } => "template".to_owned(),
             };
             let atime = pf
@@ -1133,7 +1105,7 @@ pub(super) fn get_profiles_with_readable_atime() -> (Vec<String>, Vec<String>) {
                 .and_then(|lp| lp.atime())
                 .map(display_duration)
                 .unwrap_or_else(|| "Unknown".to_owned());
-            let no_pp_str = if no_pp && !is_singbox { "nopp" } else { "" };
+            let no_pp_str = if no_pp { "nopp" } else { "" };
             let pxy_str = if update_with_proxy { "proxy" } else { "" };
             let extra = [domain.as_str(), atime.as_str(), no_pp_str, pxy_str]
                 .into_iter()

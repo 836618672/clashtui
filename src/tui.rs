@@ -17,6 +17,11 @@ pub use term::hold;
 pub(crate) use theme::Theme;
 
 pub static EXT_PROC: AtomicBool = AtomicBool::new(false);
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn is_active() -> bool {
+    ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+}
 
 trait TuiWidget {
     fn handle_key_event(&mut self, kv: &Key);
@@ -29,10 +34,13 @@ trait TuiWidget {
 pub fn init() -> anyhow::Result<()> {
     agent::init()?;
     theme::Theme::load();
-    term::setup()
+    term::setup()?;
+    ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
 }
 
 pub fn restore() -> anyhow::Result<()> {
+    ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     term::teardown();
     Ok(())
 }

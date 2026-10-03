@@ -187,15 +187,11 @@ teardown() {
     "default_configs/default_theme.yaml"
     "default_configs/mihomo/core_override_config.yaml"
     "default_configs/mihomo/core_override_config_no_tun.yaml"
-    "default_configs/sing-box/core_override_config.json"
-    "default_configs/sing-box/core_override_config_no_tun.json"
     "templates/mihomo/common_tpl.yaml"
     "templates/mihomo/generic_tpl.yaml"
     "templates/mihomo/generic_tpl_with_all.yaml"
     "templates/mihomo/generic_tpl_with_filter.yaml"
     "templates/mihomo/generic_tpl_with_ruleset.yaml"
-    "templates/sing-box/v1.12-tun_common_tpl.json"
-    "templates/sing-box/v1.12-tun_bypass.json"
   )
 
   local missing=0
@@ -272,5 +268,47 @@ teardown() {
 
 @test "--is-test is rejected as unknown option" {
   run bash "${PROJECT_ROOT}/installs/install" --is-test
+  [ "$status" -ne 0 ]
+}
+
+@test "installer defaults to Mihomo" {
+  run bash -c "source '${PROJECT_ROOT}/installs/install'; echo \"\$CORE_TYPE\""
+  [ "$status" -eq 0 ]
+  [ "$output" = "mihomo" ]
+}
+
+@test "removed core selection is rejected before installing" {
+  run bash "${PROJECT_ROOT}/installs/install" --core all
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Invalid core type"* ]]
+}
+
+@test "cancelled uninstall returns failure without touching installation" {
+  run bash -c "printf 'n\\n' | bash '${PROJECT_ROOT}/installs/install' --is-user --uninstall"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Uninstallation cancelled"* ]]
+}
+
+@test "safe_link replaces an existing file with the selected executable" {
+  printf 'new binary' > "$TEST_OUTPUT/source"
+  printf 'old binary' > "$TEST_OUTPUT/destination"
+  run bash -c "source '${PROJECT_ROOT}/installs/install'; SUDO=''; safe_link '$TEST_OUTPUT/source' '$TEST_OUTPUT/destination'"
+  [ "$status" -eq 0 ]
+  [ -L "$TEST_OUTPUT/destination" ]
+  [ "$(cat "$TEST_OUTPUT/destination")" = 'new binary' ]
+}
+
+@test "safe_link preserves its source when it is already installed" {
+  printf 'current binary' > "$TEST_OUTPUT/source"
+  run bash -c "source '${PROJECT_ROOT}/installs/install'; SUDO=''; safe_link '$TEST_OUTPUT/source' '$TEST_OUTPUT/source'"
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_OUTPUT/source" ]
+  [ ! -L "$TEST_OUTPUT/source" ]
+  [ "$(cat "$TEST_OUTPUT/source")" = 'current binary' ]
+}
+
+@test "local contrib copy failure is reported instead of returning success" {
+  printf 'config' > "$TEST_OUTPUT/source.yaml"
+  run bash -c "source '${PROJECT_ROOT}/installs/install'; CONTRIB_SOURCE=local; CONTRIB_DIR='$TEST_OUTPUT'; copy_contrib source.yaml '$TEST_OUTPUT/missing-parent/config.yaml'"
   [ "$status" -ne 0 ]
 }

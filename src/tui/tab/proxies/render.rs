@@ -42,37 +42,12 @@ pub fn render(content: &Proxies, f: &mut Frame, area: Rect, state: &mut ListStat
         return;
     }
 
-    // Compute filtered view
+    // Keep application selection in tree coordinates; only the widget uses
+    // filtered row coordinates. Otherwise a redraw changes the action target.
     let all_nodes = &content.tree.nodes;
-    let filtered_indices: Vec<usize> = all_nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, node)| {
-            content
-                .filter
-                .as_deref()
-                .is_none_or(|pat| node.name.to_lowercase().contains(&pat.to_lowercase()))
-        })
-        .map(|(i, _)| i)
-        .collect();
-
+    let filtered_indices = content.normalize_cursor(state);
     let current = state.selected().unwrap_or(0);
-    let filter_cursor = if content.filter.is_some() && !filtered_indices.is_empty() {
-        // Snap cursor to nearest visible match
-        if filtered_indices.contains(&current) {
-            filtered_indices.iter().position(|&i| i == current)
-        } else {
-            // Find nearest match (first index >= current, or last)
-            filtered_indices
-                .iter()
-                .position(|&i| i >= current)
-                .or_else(|| Some(filtered_indices.len().saturating_sub(1)))
-        }
-    } else if current >= all_nodes.len() {
-        None
-    } else {
-        Some(current)
-    };
+    let filter_cursor = filtered_indices.iter().position(|&index| index == current);
 
     // Build footer
     let mut footer_parts: Vec<String> = Vec::new();
@@ -197,22 +172,13 @@ pub fn render(content: &Proxies, f: &mut Frame, area: Rect, state: &mut ListStat
         })
         .collect();
 
-    // Update state cursor for filtered view
-    if content.filter.is_some() {
-        if let Some(fc) = filter_cursor {
-            if fc < items.len() {
-                state.select(Some(fc));
-            } else {
-                state.select(None);
-            }
-        } else {
-            state.select(None);
-        }
-    }
+    let mut display_state = *state;
+    display_state.select(filter_cursor);
 
     let list = List::new(items)
         .block(block)
         .highlight_style(section.highlight);
 
-    f.render_stateful_widget(list, area, state);
+    f.render_stateful_widget(list, area, &mut display_state);
+    *state.offset_mut() = display_state.offset();
 }

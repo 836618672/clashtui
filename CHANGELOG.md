@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Shared management workflows for CLI, TUI and the local Web interface, including transactional document saves, subscription updates, template generation and service operations.
+- A local management Web interface alongside the pinned MetaCubeXD v1.273.1 panel, with separate authentication and persistent job results.
+- Automated mock, browser, PTY and real Mihomo VM acceptance tests, plus public subscription, installation lifecycle, maintenance and bounded soak suites.
+
+### Removed
+- sing-box support, core switching, JSON templates, bundled resources and installer downloads. CLI, TUI and Web now manage Mihomo only.
+
+### Changed
+- Legacy databases retain Mihomo profiles and preserve the original content in `clashtui.db.before-mihomo-only` before discarded legacy data can be rewritten.
+- Reorganize documentation into guides, development, reference, testing and historical archives, with current progress and test evidence linked from `docs/README.md`.
+
+### Fixed
+- Provider path validation, text/MRS rule handling, subscription failure reporting, empty group fallback and read-only database revision changes.
+- TUI editor recovery, filtered node selection and Web polling conflicts with foreground edits and operations.
+- Installer cancellation status, service shutdown and autostart cleanup during uninstall, file linking and privileged configuration copies.
+
+### Validation status
+- Debian/Mihomo 1.19.24 acceptance: 64 groups passed, one unsupported capability skipped; user/system installation and seven maintenance cases passed.
+- Public UDP forwarding remains unverified after probe timeouts. Human experience checks, native macOS/Windows acceptance and broader version/load coverage remain pending; see [current project status](docs/reference/project_status_zh.md).
+
 ## [0.3.2-alpha.2] - 2026-06-01
 
 ### Added

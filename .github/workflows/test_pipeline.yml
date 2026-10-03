@@ -1,0 +1,71 @@
+name: Test pipeline
+on:
+  pull_request:
+    paths: ['src/**', 'tests/**', 'web/**', 'scripts/**', 'Cargo.*', 'build.rs', '.github/workflows/test_pipeline.yml']
+  push:
+    branches: [main, dev]
+    paths: ['src/**', 'tests/**', 'web/**', 'scripts/**', 'Cargo.*', 'build.rs', '.github/workflows/test_pipeline.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  safe-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: Swatinem/rust-cache@v2
+      - run: node scripts/test-pipeline.mjs
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-report-${{ matrix.os }}
+          path: target/test-results/
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --all-features
+      - run: npm ci --prefix tests/browser
+      - run: cd tests/browser && npx playwright install --with-deps chromium
+      - name: Fetch the pinned MetaCubeXD test asset
+        run: curl --fail --location --retry 3 https://github.com/MetaCubeX/metacubexd/releases/download/v1.273.1/compressed-dist.tgz --output "$RUNNER_TEMP/metacubexd-v1.273.1.tgz"
+      - run: npm test --prefix tests/browser
+        env:
+          CLASHTUI_METACUBEXD_ARCHIVE: ${{ runner.temp }}/metacubexd-v1.273.1.tgz
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-results
+          path: |
+            tests/browser/playwright-report/
+            tests/browser/test-results/
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.89.0'
+      - run: cargo check --locked --all-features
+      - run: cargo check --locked --no-default-features

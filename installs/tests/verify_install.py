@@ -81,7 +81,7 @@ def _install_root(path: str) -> str:
 
 def find_install_roots(cfg: dict) -> set[str]:
     roots = set()
-    for section_name in ("mihomo", "singbox"):
+    for section_name in ("mihomo",):
         core = cfg.get(section_name, {})
         if not isinstance(core, dict):
             continue
@@ -121,7 +121,7 @@ def resolve_service_path(name: str, controller: str, is_user: bool) -> str | Non
 
 
 def show_service_files(cfg: dict) -> None:
-    for section_name in ("mihomo", "singbox"):
+    for section_name in ("mihomo",):
         section = cfg.get(section_name, {})
         if not isinstance(section, dict):
             continue
@@ -262,17 +262,12 @@ def verify_system_install(cfg: dict) -> None:
         return section.get("core", {}) if isinstance(section, dict) else {}
 
     mihomo_core = get_core("mihomo")
-    singbox_core = get_core("singbox")
 
     if is_linux:
         if mihomo_core:
             check_user("mihomo", "mihomo")
             check_group("mihomo", "mihomo")
             check_user_in_group(current_user, "mihomo")
-        if singbox_core:
-            check_user("sing-box", "sing-box")
-            check_group("sing-box", "sing-box")
-            check_user_in_group(current_user, "sing-box")
 
     if mihomo_core:
         config_path = mihomo_core.get("config_path", "")
@@ -289,20 +284,6 @@ def verify_system_install(cfg: dict) -> None:
             if config_dir and os.path.isdir(config_dir):
                 check_group_writable("mihomo config_dir", config_dir)
 
-    if singbox_core:
-        config_path = singbox_core.get("config_path", "")
-        config_dir = singbox_core.get("config_dir", "")
-        if is_linux:
-            if config_path and os.path.isfile(config_path):
-                check_owner("singbox config", config_path, "sing-box", "sing-box")
-                check_group_readable("singbox config", config_path)
-            if config_dir and os.path.isdir(config_dir):
-                check_group_writable("singbox config_dir", config_dir)
-        elif is_macos:
-            if config_path and os.path.isfile(config_path):
-                check_group_readable("singbox config", config_path)
-            if config_dir and os.path.isdir(config_dir):
-                check_group_writable("singbox config_dir", config_dir)
 
 
 def verify_user_install(cfg: dict) -> None:
@@ -315,17 +296,8 @@ def is_system_install(cfg: dict) -> bool:
         service = mihomo.get("core_service", {})
         if isinstance(service, dict) and service.get("is_user") is False:
             return True
-    singbox = cfg.get("singbox", {})
-    if isinstance(singbox, dict):
-        service = singbox.get("core_service", {})
-        if isinstance(service, dict) and service.get("is_user") is False:
-            return True
     if isinstance(mihomo, dict):
         service = mihomo.get("core_service", {})
-        if isinstance(service, dict) and service.get("is_user") is True:
-            return False
-    if isinstance(singbox, dict):
-        service = singbox.get("core_service", {})
         if isinstance(service, dict) and service.get("is_user") is True:
             return False
     return False
@@ -362,11 +334,6 @@ def check_clashtui_config(config_path, yaml, cfg) -> None:
         check_path("mihomo bin_path", core.get("bin_path", ""), "bin")
         check_path("mihomo config_dir", core.get("config_dir", ""), "dir")
 
-    core = get_section("singbox")
-    if core:
-        check_path("singbox config_path", core.get("config_path", ""), "file")
-        check_path("singbox bin_path", core.get("bin_path", ""), "bin")
-        check_path("singbox config_dir", core.get("config_dir", ""), "dir")
 
     check_path("default_keymap.yaml", os.path.join(config_dir, "default_keymap.yaml"), "file")
     check_path("default_theme.yaml", os.path.join(config_dir, "default_theme.yaml"), "file")
@@ -397,7 +364,7 @@ def main() -> None:
         print_tree("clashtui config dir", config_dir)
         for root in sorted(find_install_roots(cfg)):
             print_tree("core install dir", root)
-        for core_name in ("mihomo", "singbox"):
+        for core_name in ("mihomo",):
             core = cfg.get(core_name, {})
             if isinstance(core, dict):
                 core = core.get("core", {})

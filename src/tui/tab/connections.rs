@@ -1,6 +1,7 @@
 use super::dev::*;
 use crate::functions::restful::connection::{self, Conn};
 use crate::tui::widget::fzffind;
+use crate::tui::widget::popmsg::Confirm;
 use ratatui::text::Line;
 use ratatui::widgets::{Cell, Row, Table};
 use std::collections::HashMap;
@@ -71,6 +72,13 @@ mod_agent!(
             "Reset sort"
         ),
         ([KeyCode::Char('/')], Key::Search, "Search/Filter"),
+        ([KeyCode::Esc], Key::ClearFilter, "Clear filter"),
+        ([KeyCode::Enter], Key::Details, "Connection details"),
+        (
+            [KeyCode::Char('e')],
+            Key::Export,
+            "Export displayed connections"
+        ),
         ([KeyCode::Char('p')], Key::TogglePause, "Pause/Resume"),
         ([KeyCode::Char('f')], Key::FzfFind, "Find"),
     ]
@@ -93,6 +101,9 @@ pub enum Key {
     SortByUlSpeed,
     SortReset,
     Search,
+    ClearFilter,
+    Details,
+    Export,
     TogglePause,
     FzfFind,
 }
@@ -182,6 +193,9 @@ struct Connections {
     sort_state: SortState,
     filter: Option<String>,
     paused: bool,
+    last_sample: Option<std::time::Instant>,
+    sample_elapsed: Option<f64>,
+    speeds: HashMap<String, (u64, u64)>,
 }
 
 fn human_bytes(bytes: u64) -> String {
@@ -294,25 +308,21 @@ impl BasicTabContent for Connections {
     }
 
     fn after_sync(&self, task_set: &mut FutureSet<Self>) {
-        if self.paused {
-            return;
-        }
-        if crate::config::is_core_mismatch() {
+        if self.paused || !task_set.is_empty() {
             return;
         }
         async {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let info = tri!(
-                tokio::task::spawn_blocking(connection::get_connections)
+                crate::functions::restful::session::spawn_blocking(connection::get_connections)
                     .await
                     .unwrap(),
                 or_set
             );
             wrapper(|content: &mut Self| {
                 let conns = info.connections.unwrap_or_default();
-                content.conns = conns;
                 content.error = None;
-                content.refresh_display_rows();
+                content.accept_connections(conns);
             })
         }
         .spawn_at(task_set);
@@ -320,24 +330,17 @@ impl BasicTabContent for Connections {
 
     fn on_enter(&mut self, task_set: &mut FutureSet<Self>, _state: &mut Self::State) {
         self.paused = false;
-        if crate::config::is_core_mismatch() {
-            self.conns = Vec::new();
-            self.display_rows = Vec::new();
-            self.error = Some("API data mismatch with configured core".to_owned());
-            return;
-        }
         async {
             let info = tri!(
-                tokio::task::spawn_blocking(connection::get_connections)
+                crate::functions::restful::session::spawn_blocking(connection::get_connections)
                     .await
                     .unwrap(),
                 or_set
             );
             wrapper(|content: &mut Self| {
                 let conns = info.connections.unwrap_or_default();
-                content.conns = conns;
                 content.error = None;
-                content.refresh_display_rows();
+                content.accept_connections(conns);
             })
         }
         .spawn_at(task_set);
@@ -396,17 +399,19 @@ impl TabContent for Connections {
                 };
                 let id = display_row.id.clone();
                 async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        let _ = connection::terminate_connection(Some(id));
-                        connection::get_connections()
+                    let result = crate::functions::restful::session::spawn_blocking(move || {
+                        anyhow::ensure!(
+                            connection::terminate_connection(Some(id))?,
+                            "Core did not confirm connection closure"
+                        );
+                        Ok::<_, anyhow::Error>(connection::get_connections()?)
                     })
                     .await
                     .unwrap();
-                    let info = tri!(result, or_cancel);
+                    let info = tri!(result);
                     wrapper(move |content: &mut Connections| {
-                        content.conns = info.connections.unwrap_or_default();
                         content.error = None;
-                        content.refresh_display_rows();
+                        content.accept_connections(info.connections.unwrap_or_default());
                         if content.row.unwrap_or(0) >= content.display_rows.len() {
                             content.row = content.display_rows.len().checked_sub(1);
                         }
@@ -415,40 +420,417 @@ impl TabContent for Connections {
                 .spawn_at(task_set);
             }
             Key::TerminateAll => {
-                let (use_bulk, ids): (bool, Vec<String>) = if let Some(ref pat) = self.filter {
-                    let ids: Vec<String> = self
-                        .display_rows
-                        .iter()
-                        .filter(|r| {
-                            r.host.contains(pat)
-                                || r.rule.contains(pat)
-                                || r.chains.contains(pat)
-                                || r.id.contains(pat)
-                        })
-                        .map(|r| r.id.clone())
-                        .collect();
-                    (false, ids)
-                } else {
-                    (true, Vec::new())
-                };
-
-                let count = if self.filter.is_some() {
-                    ids.len()
-                } else {
-                    self.display_rows.len()
-                };
-
-                if count == 0 {
+                if self.error.is_some() {
                     return;
                 }
-
+                let ids: Vec<String> = self.display_rows.iter().map(|r| r.id.clone()).collect();
+                if ids.is_empty() {
+                    return;
+                }
                 async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        if use_bulk {
-                            let _ = connection::terminate_all_connections();
-                        } else {
-                            for id in &ids {
-                                let _ = connection::terminate_connection(Some(id.clone()));
+                    if Confirm::title(format!("Close {} displayed connections?", ids.len()))
+                        .with_prompt(
+                            "Only the captured IDs will be closed. Enter confirms; Esc cancels."
+                                .to_owned(),
+                        )
+                        .build_and_send()
+                        .await
+                        .is_err()
+                    {
+                        return do_nothing();
+                    }
+                    let result = crate::functions::restful::session::spawn_blocking(move || {
+                        let failures = connection::terminate_ids(&ids);
+                        connection::get_connections().map(|info| (info, failures))
+                    })
+                    .await
+                    .unwrap();
+                    let (info, failures) = tri!(result);
+                    if !failures.is_empty() {
+                        Confirm::err(failures.join("\n"));
+                    }
+                    wrapper(move |content: &mut Connections| {
+                        content.error = None;
+                        content.accept_connections(info.connections.unwrap_or_default());
+                    })
+                }
+                .spawn_at(task_set);
+            }
+            Key::ClearFilter => {
+                self.filter = None;
+                self.refresh_display_rows();
+            }
+            Key::Details => {
+                if let Some(conn) = self
+                    .row
+                    .and_then(|i| self.display_rows.get(i))
+                    .and_then(|r| self.conns.iter().find(|c| c.id == r.id))
+                {
+                    Confirm::dismiss_any("Connection details".to_owned())
+                        .with_prompt(serde_json::to_string_pretty(conn).unwrap_or_default())
+                        .build_and_send();
+                }
+            }
+            Key::Export => {
+                let conns: Vec<Conn> = self
+                    .display_rows
+                    .iter()
+                    .filter_map(|r| self.conns.iter().find(|c| c.id == r.id).cloned())
+                    .collect();
+                async move {
+                    let path = tri!(
+                        Input::new()
+                            .with_title("Export connections to a new JSON file".to_owned())
+                            .build_and_send()
+                            .await,
+                        or_cancel
+                    );
+                    tri!(
+                        crate::functions::restful::session::spawn_blocking(move || {
+                            crate::functions::file::export_json(
+                                std::path::Path::new(&path),
+                                &serde_json::to_value(conns)?,
+                            )
+                        })
+                        .await
+                        .unwrap()
+                    );
+                    do_nothing()
+                }
+                .spawn_at(task_set);
+            }
+            Key::SortByHost => self.toggle_sort(SortColumn::Host),
+            Key::SortByRule => self.toggle_sort(SortColumn::Rule),
+            Key::SortByChains => self.toggle_sort(SortColumn::Chains),
+            Key::SortByDownload => self.toggle_sort(SortColumn::Download),
+            Key::SortByUpload => self.toggle_sort(SortColumn::Upload),
+            Key::SortByDlSpeed => self.toggle_sort(SortColumn::DlSpeed),
+            Key::SortByUlSpeed => self.toggle_sort(SortColumn::UlSpeed),
+            Key::SortReset => {
+                self.sort_state = SortState::default();
+                self.apply_sort();
+            }
+            Key::Search => {
+                async move {
+                    let filter = tri!(
+                        Input::new()
+                            .with_title("Filter".to_owned())
+                            .build_and_send()
+                            .await,
+                        or_cancel
+                    );
+                    wrapper(move |content: &mut Connections| {
+                        content.filter = (!filter.is_empty()).then_some(filter);
+                        content.refresh_display_rows();
+                    })
+                }
+                .spawn_at(task_set);
+            }
+            Key::TogglePause => {
+                self.paused = !self.paused;
+            }
+            Key::FzfFind => {
+                self.paused = true;
+                let names: Vec<String> = self
+                    .display_rows
+                    .iter()
+                    .map(|r| format!("{} | {} | {}", r.host, r.rule, r.chains))
+                    .collect();
+                async move {
+                    let selected = crate::functions::restful::session::spawn_blocking(move || {
+                        fzffind::run_fzf(&names, "Find Connection")
+                    })
+                    .await
+                    .unwrap_or(None);
+                    wrapper(move |content: &mut Connections| {
+                        content.row = selected;
+                    })
+                }
+                .spawn_at(task_set);
+            }
+        }
+    }
+
+    fn render(&self, f: &mut Frame, area: Rect, _state: &mut Self::State) {
+        let theme = Theme::get();
+        let section = theme.section("connections");
+        let block = Block::bordered()
+            .border_style(section.border)
+            .title(Self::TITLE);
+
+        let mut title = if let Some(filter) = self.filter.as_ref() {
+            format!(" / {filter} ")
+        } else {
+            String::new()
+        };
+        if self.paused {
+            title.push_str(" [PAUSED]");
+        }
+        if let Some(error) = &self.error {
+            title.push_str(&format!(" [STALE: {error}]"));
+        }
+        let block = if title.is_empty() {
+            block
+        } else {
+            block.title_bottom(Line::raw(title).right_aligned().reversed())
+        };
+
+        if !self.error.as_deref().unwrap_or("").is_empty() && self.display_rows.is_empty() {
+            let widget =
+                ratatui::widgets::Paragraph::new(self.error.as_deref().unwrap_or("")).block(block);
+            f.render_widget(widget, area);
+            return;
+        }
+
+        let sort_indicator = if let Some(col) = self.sort_state.column {
+            let dir = if self.sort_state.direction == SortDirection::Descending {
+                "▼"
+            } else {
+                "▲"
+            };
+            let name = match col {
+                SortColumn::Host => "Host",
+                SortColumn::Rule => "Rule",
+                SortColumn::Chains => "Chains",
+                SortColumn::Download => "Dn",
+                SortColumn::Upload => "Up",
+                SortColumn::DlSpeed => "DL",
+                SortColumn::UlSpeed => "UL",
+            };
+            format!(" ({name} {dir})")
+        } else {
+            String::new()
+        };
+
+        let filtered_count = self.display_rows.len();
+
+        let count_text = if self.filter.is_some() {
+            format!(
+                "{}/{} conns{}",
+                filtered_count,
+                self.conns.len(),
+                sort_indicator
+            )
+        } else {
+            format!("{} conns{}", self.display_rows.len(), sort_indicator)
+        };
+
+        let header_style = section.border;
+        let header_cells = [
+            sort_header(self.sort_state, SortColumn::Host, HOST_COL),
+            sort_header(self.sort_state, SortColumn::Rule, RULE_COL),
+            sort_header(self.sort_state, SortColumn::Chains, CHAINS_COL),
+            sort_header(self.sort_state, SortColumn::Download, DL_COL),
+            sort_header(self.sort_state, SortColumn::Upload, UL_COL),
+            sort_header(self.sort_state, SortColumn::DlSpeed, DLSPD_COL),
+            sort_header(self.sort_state, SortColumn::UlSpeed, ULSPD_COL),
+        ]
+        .into_iter()
+        .map(|h| Cell::from(h).style(header_style));
+
+        let header = Row::new(header_cells).height(1);
+
+        let widths = [
+            ratatui::prelude::Constraint::Min(30),
+            ratatui::prelude::Constraint::Max(15),
+            ratatui::prelude::Constraint::Min(15),
+            ratatui::prelude::Constraint::Max(10),
+            ratatui::prelude::Constraint::Max(10),
+            ratatui::prelude::Constraint::Max(10),
+            ratatui::prelude::Constraint::Max(10),
+        ];
+
+        let rows: Vec<Row> = self
+            .display_rows
+            .iter()
+            .map(|r| {
+                Row::new(vec![
+                    Cell::from(r.host.as_str()),
+                    Cell::from(r.rule.as_str()),
+                    Cell::from(r.chains.as_str()),
+                    Cell::from(human_bytes(r.download)),
+                    Cell::from(human_bytes(r.upload)),
+                    Cell::from(human_speed(r.dl_speed)),
+                    Cell::from(human_speed(r.ul_speed)),
+                ])
+                .height(1)
+            })
+            .collect();
+
+        let highlight_style = section.highlight;
+        let table = Table::new(rows, widths)
+            .header(header)
+            .block(block.title_bottom(Line::raw(count_text).right_aligned()))
+            .row_highlight_style(highlight_style);
+
+        if let Some(selected) = self.row {
+            f.render_stateful_widget(
+                table,
+                area,
+                &mut ratatui::widgets::TableState::new()
+                    .with_selected(Some(selected))
+                    .with_offset(0),
+            );
+        } else {
+            f.render_stateful_widget(
+                table,
+                area,
+                &mut ratatui::widgets::TableState::default().with_offset(0),
+            );
+        }
+    }
+}
+
+impl Connections {
+    fn accept_connections(&mut self, conns: Vec<Conn>) {
+        let now = std::time::Instant::now();
+        self.sample_elapsed = Some(
+            self.last_sample
+                .map_or(1.0, |time| {
+                    now.saturating_duration_since(time).as_secs_f64()
+                })
+                .max(0.001),
+        );
+        self.last_sample = Some(now);
+        self.conns = conns;
+        self.refresh_display_rows();
+    }
+    fn refresh_display_rows(&mut self) {
+        let selected_id = self
+            .row
+            .and_then(|row| self.display_rows.get(row))
+            .map(|row| row.id.clone());
+        self.display_rows = make_display_rows(&self.conns, &mut self.last_bytes);
+        for row in &mut self.display_rows {
+            if let Some(elapsed) = self.sample_elapsed {
+                row.dl_speed = (row.dl_speed as f64 / elapsed) as u64;
+                row.ul_speed = (row.ul_speed as f64 / elapsed) as u64;
+                self.speeds
+                    .insert(row.id.clone(), (row.dl_speed, row.ul_speed));
+            } else if let Some((down, up)) = self.speeds.get(&row.id) {
+                row.dl_speed = *down;
+                row.ul_speed = *up;
+            }
+        }
+        self.sample_elapsed = None;
+        self.speeds
+            .retain(|id, _| self.conns.iter().any(|conn| &conn.id == id));
+        self.last_bytes
+            .retain(|id, _| self.conns.iter().any(|c| &c.id == id));
+        if let Some(filter) = self.filter.as_deref() {
+            let filter = filter.to_lowercase();
+            self.display_rows.retain(|row| {
+                row.host.to_lowercase().contains(&filter)
+                    || self.conns.iter().find(|c| c.id == row.id).is_some_and(|c| {
+                        serde_json::to_string(c)
+                            .unwrap_or_default()
+                            .to_lowercase()
+                            .contains(&filter)
+                    })
+            });
+        }
+        // Store original order index in a separate field would be ideal,
+        // but we can rebuild from conns on SortReset since conns retains API order
+        self.apply_sort();
+        if let Some(index) =
+            selected_id.and_then(|id| self.display_rows.iter().position(|row| row.id == id))
+        {
+            self.row = Some(index);
+        }
+        // Clamp cursor to valid range
+        if self.display_rows.is_empty() {
+            self.row = None;
+        } else if let Some(r) = self.row {
+            if r >= self.display_rows.len() {
+                self.row = Some(self.display_rows.len().saturating_sub(1));
+            }
+        } else {
+            self.row = Some(0);
+        }
+    }
+
+    fn toggle_sort(&mut self, column: SortColumn) {
+        if self.sort_state.column == Some(column) {
+            match self.sort_state.direction {
+                SortDirection::Descending => self.sort_state.direction = SortDirection::Ascending,
+                SortDirection::Ascending => self.sort_state = SortState::default(),
+            }
+        } else {
+            self.sort_state = SortState {
+                column: Some(column),
+                direction: SortDirection::Descending,
+            };
+        }
+        self.apply_sort();
+    }
+
+    fn apply_sort(&mut self) {
+        let Some(column) = self.sort_state.column else {
+            let orig_ids: Vec<String> = self.conns.iter().map(|c| c.id.clone()).collect();
+            self.display_rows.sort_by_key(|r| {
+                orig_ids
+                    .iter()
+                    .position(|id| *id == r.id)
+                    .unwrap_or(usize::MAX)
+            });
+            return;
+        };
+        let descending = self.sort_state.direction == SortDirection::Descending;
+        match column {
+            SortColumn::Host => {
+                if descending {
+                    self.display_rows.sort_by(|a, b| b.host.cmp(&a.host));
+                } else {
+                    self.display_rows.sort_by(|a, b| a.host.cmp(&b.host));
+                }
+            }
+            SortColumn::Rule => {
+                if descending {
+                    self.display_rows.sort_by(|a, b| b.rule.cmp(&a.rule));
+                } else {
+                    self.display_rows.sort_by(|a, b| a.rule.cmp(&b.rule));
+                }
+            }
+            SortColumn::Chains => {
+                if descending {
+                    self.display_rows.sort_by(|a, b| b.chains.cmp(&a.chains));
+                } else {
+                    self.display_rows.sort_by(|a, b| a.chains.cmp(&b.chains));
+                }
+            }
+            SortColumn::Download => {
+                if descending {
+                    self.display_rows
+                        .sort_by_key(|a| std::cmp::Reverse(a.download));
+                } else {
+                    self.display_rows.sort_by_key(|a| a.download);
+                }
+            }
+            SortColumn::Upload => {
+                if descending {
+                    self.display_rows
+                        .sort_by_key(|a| std::cmp::Reverse(a.upload));
+                } else {
+                    self.display_rows.sort_by_key(|a| a.upload);
+                }
+            }
+            SortColumn::DlSpeed => {
+                if descending {
+                    self.display_rows
+                        .sort_by_key(|a| std::cmp::Reverse(a.dl_speed));
+                } else {
+                    self.display_rows.sort_by_key(|a| a.dl_speed);
+                }
+            }
+            SortColumn::UlSpeed => {
+                if descending {
+                    self.display_rows
+                        .sort_by_key(|a| std::cmp::Reverse(a.ul_speed));
+                } else {
+                    self.display_rows.sort_by_key(|a| a.ul_speed);
+                }
+            }
+        }
     }
 }
 
@@ -456,7 +838,7 @@ impl TabContent for Connections {
 #[allow(dead_code)]
 mod tests {
     use super::*;
-    use crate::functions::restful::connection::{ConnMetaData, Conn};
+    use crate::functions::restful::connection::{Conn, ConnMetaData};
 
     fn mk_key(code: KeyCode) -> crate::tui::Key {
         crate::tui::Key {
@@ -470,8 +852,10 @@ mod tests {
 
     fn conn(id: &str, host: &str) -> Conn {
         Conn {
+            extra: Default::default(),
             id: id.to_owned(),
             metadata: ConnMetaData {
+                extra: Default::default(),
                 network: "tcp".to_owned(),
                 ctype: "".to_owned(),
                 host: host.to_owned(),
@@ -503,6 +887,17 @@ mod tests {
     }
 
     #[test]
+    fn process_filter_and_close_selection_use_the_same_connection_ids() {
+        let mut second = conn("selected", "second.example");
+        second.metadata.process_path = "/Applications/Browser.app".to_owned();
+        let mut content = mk_conns(&[conn("hidden", "first.example"), second]);
+        content.filter = Some("browser".to_owned());
+        content.refresh_display_rows();
+        assert_eq!(content.display_rows.len(), 1);
+        assert_eq!(content.display_rows[content.row.unwrap()].id, "selected");
+    }
+
+    #[test]
     fn key_agent_contains_single_keys() {
         let a = agent();
         assert!(a.contains_key(&mk_key(KeyCode::Char('j'))));
@@ -514,12 +909,30 @@ mod tests {
 
     #[test]
     fn key_try_from_returns_correct_actions() {
-        assert!(matches!(Key::try_from(&mk_key(KeyCode::Char('j'))), Ok(Key::MoveDown)));
-        assert!(matches!(Key::try_from(&mk_key(KeyCode::Char('k'))), Ok(Key::MoveUp)));
-        assert!(matches!(Key::try_from(&mk_key(KeyCode::Char('G'))), Ok(Key::GoBottom)));
-        assert!(matches!(Key::try_from(&mk_key(KeyCode::Char('/'))), Ok(Key::Search)));
-        assert!(matches!(Key::try_from(&mk_key(KeyCode::Char('p'))), Ok(Key::TogglePause)));
-        assert!(matches!(Key::try_from(&mk_key(KeyCode::Char('f'))), Ok(Key::FzfFind)));
+        assert!(matches!(
+            Key::try_from(&mk_key(KeyCode::Char('j'))),
+            Ok(Key::MoveDown)
+        ));
+        assert!(matches!(
+            Key::try_from(&mk_key(KeyCode::Char('k'))),
+            Ok(Key::MoveUp)
+        ));
+        assert!(matches!(
+            Key::try_from(&mk_key(KeyCode::Char('G'))),
+            Ok(Key::GoBottom)
+        ));
+        assert!(matches!(
+            Key::try_from(&mk_key(KeyCode::Char('/'))),
+            Ok(Key::Search)
+        ));
+        assert!(matches!(
+            Key::try_from(&mk_key(KeyCode::Char('p'))),
+            Ok(Key::TogglePause)
+        ));
+        assert!(matches!(
+            Key::try_from(&mk_key(KeyCode::Char('f'))),
+            Ok(Key::FzfFind)
+        ));
     }
 
     #[test]
@@ -649,8 +1062,26 @@ mod tests {
     fn apply_sort_by_download_descending() {
         let mut c = Connections {
             display_rows: vec![
-                DisplayRow { host: "a".into(), rule: "".into(), chains: "".into(), download: 100, upload: 0, dl_speed: 0, ul_speed: 0, id: "1".into() },
-                DisplayRow { host: "b".into(), rule: "".into(), chains: "".into(), download: 500, upload: 0, dl_speed: 0, ul_speed: 0, id: "2".into() },
+                DisplayRow {
+                    host: "a".into(),
+                    rule: "".into(),
+                    chains: "".into(),
+                    download: 100,
+                    upload: 0,
+                    dl_speed: 0,
+                    ul_speed: 0,
+                    id: "1".into(),
+                },
+                DisplayRow {
+                    host: "b".into(),
+                    rule: "".into(),
+                    chains: "".into(),
+                    download: 500,
+                    upload: 0,
+                    dl_speed: 0,
+                    ul_speed: 0,
+                    id: "2".into(),
+                },
             ],
             ..Default::default()
         };
@@ -691,7 +1122,10 @@ mod tests {
 
     #[test]
     fn refresh_display_rows_none_when_empty() {
-        let mut c = Connections { row: Some(0), ..Default::default() };
+        let mut c = Connections {
+            row: Some(0),
+            ..Default::default()
+        };
         c.refresh_display_rows();
         assert!(c.row.is_none());
     }
@@ -703,9 +1137,10 @@ mod tests {
         c.row = Some(0);
         // simulate Key::MoveUp handler logic inline
         if let Some(r) = c.row
-            && r > 0 {
-                c.row = Some(r - 1);
-            }
+            && r > 0
+        {
+            c.row = Some(r - 1);
+        }
         assert_eq!(c.row, Some(0));
     }
 
@@ -715,9 +1150,10 @@ mod tests {
         let mut c = mk_conns(conns);
         c.row = Some(1);
         if let Some(r) = c.row
-            && r + 1 < c.display_rows.len() {
-                c.row = Some(r + 1);
-            }
+            && r + 1 < c.display_rows.len()
+        {
+            c.row = Some(r + 1);
+        }
         assert_eq!(c.row, Some(1));
     }
 
@@ -769,320 +1205,10 @@ mod tests {
         let shortcuts = agent::all_shortcuts();
         let single_key_count = shortcuts.iter().filter(|(c, _, _)| c.len() == 1).count();
         let chord_count = shortcuts.iter().filter(|(c, _, _)| c.len() > 1).count();
-        assert!(single_key_count >= 6, "should have at least 6 single-key shortcuts");
+        assert!(
+            single_key_count >= 6,
+            "should have at least 6 single-key shortcuts"
+        );
         assert!(chord_count >= 7, "should have at least 7 chord shortcuts");
-    }
-}
-                        connection::get_connections()
-                    })
-                    .await
-                    .unwrap();
-                    let info = tri!(result, or_cancel);
-                    wrapper(move |content: &mut Connections| {
-                        content.conns = info.connections.unwrap_or_default();
-                        content.error = None;
-                        content.refresh_display_rows();
-                        content.row = None;
-                    })
-                }
-                .spawn_at(task_set);
-            }
-            Key::SortByHost => self.toggle_sort(SortColumn::Host),
-            Key::SortByRule => self.toggle_sort(SortColumn::Rule),
-            Key::SortByChains => self.toggle_sort(SortColumn::Chains),
-            Key::SortByDownload => self.toggle_sort(SortColumn::Download),
-            Key::SortByUpload => self.toggle_sort(SortColumn::Upload),
-            Key::SortByDlSpeed => self.toggle_sort(SortColumn::DlSpeed),
-            Key::SortByUlSpeed => self.toggle_sort(SortColumn::UlSpeed),
-            Key::SortReset => {
-                self.sort_state = SortState::default();
-                self.apply_sort();
-            }
-            Key::Search => {
-                async move {
-                    let filter = tri!(
-                        Input::new()
-                            .with_title("Filter".to_owned())
-                            .build_and_send()
-                            .await,
-                        or_cancel
-                    );
-                    wrapper(move |content: &mut Connections| {
-                        content.filter = (!filter.is_empty()).then_some(filter);
-                    })
-                }
-                .spawn_at(task_set);
-            }
-            Key::TogglePause => {
-                self.paused = !self.paused;
-            }
-            Key::FzfFind => {
-                self.paused = true;
-                let names: Vec<String> = self
-                    .display_rows
-                    .iter()
-                    .map(|r| format!("{} | {} | {}", r.host, r.rule, r.chains))
-                    .collect();
-                async move {
-                    let selected = tokio::task::spawn_blocking(move || {
-                        fzffind::run_fzf(&names, "Find Connection")
-                    })
-                    .await
-                    .unwrap_or(None);
-                    wrapper(move |content: &mut Connections| {
-                        content.row = selected;
-                    })
-                }
-                .spawn_at(task_set);
-            }
-        }
-    }
-
-    fn render(&self, f: &mut Frame, area: Rect, _state: &mut Self::State) {
-        let theme = Theme::get();
-        let section = theme.section("connections");
-        let block = Block::bordered()
-            .border_style(section.border)
-            .title(Self::TITLE);
-
-        let mut title = if let Some(filter) = self.filter.as_ref() {
-            format!(" / {filter} ")
-        } else {
-            String::new()
-        };
-        if self.paused {
-            title.push_str(" [PAUSED]");
-        }
-        let block = if title.is_empty() {
-            block
-        } else {
-            block.title_bottom(Line::raw(title).right_aligned().reversed())
-        };
-
-        if !self.error.as_deref().unwrap_or("").is_empty() && self.display_rows.is_empty() {
-            let widget =
-                ratatui::widgets::Paragraph::new(self.error.as_deref().unwrap_or("")).block(block);
-            f.render_widget(widget, area);
-            return;
-        }
-
-        let sort_indicator = if let Some(col) = self.sort_state.column {
-            let dir = if self.sort_state.direction == SortDirection::Descending {
-                "▼"
-            } else {
-                "▲"
-            };
-            let name = match col {
-                SortColumn::Host => "Host",
-                SortColumn::Rule => "Rule",
-                SortColumn::Chains => "Chains",
-                SortColumn::Download => "Dn",
-                SortColumn::Upload => "Up",
-                SortColumn::DlSpeed => "DL",
-                SortColumn::UlSpeed => "UL",
-            };
-            format!(" ({name} {dir})")
-        } else {
-            String::new()
-        };
-
-        let filtered_count: usize = self
-            .display_rows
-            .iter()
-            .filter(|r| {
-                self.filter.as_deref().is_none_or(|pat| {
-                    r.host.contains(pat)
-                        || r.rule.contains(pat)
-                        || r.chains.contains(pat)
-                        || r.id.contains(pat)
-                })
-            })
-            .count();
-
-        let count_text = if self.filter.is_some() {
-            format!(
-                "{}/{} conns{}",
-                filtered_count,
-                self.display_rows.len(),
-                sort_indicator
-            )
-        } else {
-            format!("{} conns{}", self.display_rows.len(), sort_indicator)
-        };
-
-        let header_style = section.border;
-        let header_cells = [
-            sort_header(self.sort_state, SortColumn::Host, HOST_COL),
-            sort_header(self.sort_state, SortColumn::Rule, RULE_COL),
-            sort_header(self.sort_state, SortColumn::Chains, CHAINS_COL),
-            sort_header(self.sort_state, SortColumn::Download, DL_COL),
-            sort_header(self.sort_state, SortColumn::Upload, UL_COL),
-            sort_header(self.sort_state, SortColumn::DlSpeed, DLSPD_COL),
-            sort_header(self.sort_state, SortColumn::UlSpeed, ULSPD_COL),
-        ]
-        .into_iter()
-        .map(|h| Cell::from(h).style(header_style));
-
-        let header = Row::new(header_cells).height(1);
-
-        let widths = [
-            ratatui::prelude::Constraint::Min(30),
-            ratatui::prelude::Constraint::Max(15),
-            ratatui::prelude::Constraint::Min(15),
-            ratatui::prelude::Constraint::Max(10),
-            ratatui::prelude::Constraint::Max(10),
-            ratatui::prelude::Constraint::Max(10),
-            ratatui::prelude::Constraint::Max(10),
-        ];
-
-        let rows: Vec<Row> = self
-            .display_rows
-            .iter()
-            .filter(|r| {
-                self.filter.as_deref().is_none_or(|pat| {
-                    r.host.contains(pat)
-                        || r.rule.contains(pat)
-                        || r.chains.contains(pat)
-                        || r.id.contains(pat)
-                })
-            })
-            .map(|r| {
-                Row::new(vec![
-                    Cell::from(r.host.as_str()),
-                    Cell::from(r.rule.as_str()),
-                    Cell::from(r.chains.as_str()),
-                    Cell::from(human_bytes(r.download)),
-                    Cell::from(human_bytes(r.upload)),
-                    Cell::from(human_speed(r.dl_speed)),
-                    Cell::from(human_speed(r.ul_speed)),
-                ])
-                .height(1)
-            })
-            .collect();
-
-        let highlight_style = section.highlight;
-        let table = Table::new(rows, widths)
-            .header(header)
-            .block(block.title_bottom(Line::raw(count_text).right_aligned()))
-            .row_highlight_style(highlight_style);
-
-        if let Some(selected) = self.row {
-            f.render_stateful_widget(
-                table,
-                area,
-                &mut ratatui::widgets::TableState::new()
-                    .with_selected(Some(selected))
-                    .with_offset(0),
-            );
-        } else {
-            f.render_stateful_widget(
-                table,
-                area,
-                &mut ratatui::widgets::TableState::default().with_offset(0),
-            );
-        }
-    }
-}
-
-impl Connections {
-    fn refresh_display_rows(&mut self) {
-        self.display_rows = make_display_rows(&self.conns, &mut self.last_bytes);
-        // Store original order index in a separate field would be ideal,
-        // but we can rebuild from conns on SortReset since conns retains API order
-        self.apply_sort();
-        // Clamp cursor to valid range
-        if self.display_rows.is_empty() {
-            self.row = None;
-        } else if let Some(r) = self.row {
-            if r >= self.display_rows.len() {
-                self.row = Some(self.display_rows.len().saturating_sub(1));
-            }
-        } else {
-            self.row = Some(0);
-        }
-    }
-
-    fn toggle_sort(&mut self, column: SortColumn) {
-        if self.sort_state.column == Some(column) {
-            match self.sort_state.direction {
-                SortDirection::Descending => self.sort_state.direction = SortDirection::Ascending,
-                SortDirection::Ascending => self.sort_state = SortState::default(),
-            }
-        } else {
-            self.sort_state = SortState {
-                column: Some(column),
-                direction: SortDirection::Descending,
-            };
-        }
-        self.apply_sort();
-    }
-
-    fn apply_sort(&mut self) {
-        let Some(column) = self.sort_state.column else {
-            let orig_ids: Vec<String> = self.conns.iter().map(|c| c.id.clone()).collect();
-            self.display_rows.sort_by_key(|r| {
-                orig_ids
-                    .iter()
-                    .position(|id| *id == r.id)
-                    .unwrap_or(usize::MAX)
-            });
-            return;
-        };
-        let descending = self.sort_state.direction == SortDirection::Descending;
-        match column {
-            SortColumn::Host => {
-                if descending {
-                    self.display_rows.sort_by(|a, b| b.host.cmp(&a.host));
-                } else {
-                    self.display_rows.sort_by(|a, b| a.host.cmp(&b.host));
-                }
-            }
-            SortColumn::Rule => {
-                if descending {
-                    self.display_rows.sort_by(|a, b| b.rule.cmp(&a.rule));
-                } else {
-                    self.display_rows.sort_by(|a, b| a.rule.cmp(&b.rule));
-                }
-            }
-            SortColumn::Chains => {
-                if descending {
-                    self.display_rows.sort_by(|a, b| b.chains.cmp(&a.chains));
-                } else {
-                    self.display_rows.sort_by(|a, b| a.chains.cmp(&b.chains));
-                }
-            }
-            SortColumn::Download => {
-                if descending {
-                    self.display_rows
-                        .sort_by_key(|a| std::cmp::Reverse(a.download));
-                } else {
-                    self.display_rows.sort_by_key(|a| a.download);
-                }
-            }
-            SortColumn::Upload => {
-                if descending {
-                    self.display_rows
-                        .sort_by_key(|a| std::cmp::Reverse(a.upload));
-                } else {
-                    self.display_rows.sort_by_key(|a| a.upload);
-                }
-            }
-            SortColumn::DlSpeed => {
-                if descending {
-                    self.display_rows
-                        .sort_by_key(|a| std::cmp::Reverse(a.dl_speed));
-                } else {
-                    self.display_rows.sort_by_key(|a| a.dl_speed);
-                }
-            }
-            SortColumn::UlSpeed => {
-                if descending {
-                    self.display_rows
-                        .sort_by_key(|a| std::cmp::Reverse(a.ul_speed));
-                } else {
-                    self.display_rows.sort_by_key(|a| a.ul_speed);
-                }
-            }
-        }
     }
 }

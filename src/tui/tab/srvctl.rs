@@ -1,6 +1,6 @@
 use super::dev::*;
 use crate::config::CoreType;
-#[cfg(unix)]
+#[cfg(windows)]
 use ratatui::style::Color;
 use ratatui::widgets::ListItem;
 
@@ -46,10 +46,11 @@ impl TryFrom<&crate::tui::Key> for SrvCtlKey {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SrvCtlOp {
+    RestartApi,
+    UpgradeCore,
     Stop,
+    Start,
     Restart,
-    SwitchCore,
-    StopAll,
     #[cfg(windows)]
     Install,
     #[cfg(windows)]
@@ -61,10 +62,11 @@ enum SrvCtlOp {
 impl SrvCtlOp {
     fn as_str(&self) -> &str {
         match self {
+            Self::RestartApi => "Restart Core via API",
+            Self::UpgradeCore => "Upgrade Mihomo via API",
             Self::Stop => "Stop Service",
-            Self::Restart => "Start Service",
-            Self::SwitchCore => "Switch Core",
-            Self::StopAll => "Stop All Services",
+            Self::Start => "Start Service",
+            Self::Restart => "Restart Service",
             #[cfg(windows)]
             Self::Install => "Install Srv",
             #[cfg(windows)]
@@ -75,7 +77,13 @@ impl SrvCtlOp {
     }
     fn all() -> Vec<Self> {
         #[cfg_attr(not(windows), allow(unused_mut))]
-        let mut ops = vec![Self::Stop, Self::Restart, Self::SwitchCore, Self::StopAll];
+        let mut ops = vec![
+            Self::Stop,
+            Self::Start,
+            Self::Restart,
+            Self::RestartApi,
+            Self::UpgradeCore,
+        ];
         #[cfg(windows)]
         {
             ops.push(Self::Install);
@@ -95,31 +103,30 @@ struct SrvCtlContent {
     status: String,
     core_label: String,
     mihomo_status: String,
-    singbox_status: String,
     mihomo_service_name: String,
-    singbox_service_name: String,
     mihomo_is_user: bool,
-    singbox_is_user: bool,
+    active: bool,
     #[cfg(windows)]
     proxy_enabled: bool,
 }
 
 impl SrvCtlContent {
-    fn spawn_status_check(&self, task_set: &mut FutureSet<Self>, target: CoreType) {
+    fn spawn_status_check(
+        &self,
+        task_set: &mut FutureSet<Self>,
+        target: CoreType,
+        delay: std::time::Duration,
+    ) {
         let (service_name, is_user, csc) = match target {
             CoreType::Mihomo => (
                 self.mihomo_service_name.clone(),
                 self.mihomo_is_user,
                 crate::config::CONFIG.cfg_file.mihomo.core_service.clone(),
             ),
-            CoreType::Singbox => (
-                self.singbox_service_name.clone(),
-                self.singbox_is_user,
-                crate::config::CONFIG.cfg_file.singbox.core_service.clone(),
-            ),
         };
         let controller = crate::config::ServiceController::from_config(&csc);
         async move {
+            tokio::time::sleep(delay).await;
             let status = match controller {
                 crate::config::ServiceController::Launchd => launchd_status(&service_name, is_user),
                 #[cfg(windows)]
@@ -157,9 +164,16 @@ impl SrvCtlContent {
                     }
                 }
             };
-            wrapper(move |c: &mut SrvCtlContent| match target {
-                CoreType::Mihomo => c.mihomo_status = status,
-                CoreType::Singbox => c.singbox_status = status,
+            #[cfg(windows)]
+            let proxy_enabled = crate::functions::command::get_system_proxy_state().ok();
+            wrapper(move |c: &mut SrvCtlContent| {
+                match target {
+                    CoreType::Mihomo => c.mihomo_status = status,
+                }
+                #[cfg(windows)]
+                if let Some(enabled) = proxy_enabled {
+                    c.proxy_enabled = enabled;
+                }
             })
         }
         .spawn_at(task_set);
@@ -224,8 +238,24 @@ impl BasicTabContent for SrvCtlContent {
     }
 
     fn on_enter(&mut self, task_set: &mut FutureSet<Self>, _state: &mut Self::State) {
-        self.spawn_status_check(task_set, CoreType::Mihomo);
-        self.spawn_status_check(task_set, CoreType::Singbox);
+        self.active = true;
+        if task_set.is_empty() {
+            self.spawn_status_check(task_set, CoreType::Mihomo, std::time::Duration::ZERO);
+        }
+    }
+
+    fn on_leave(&mut self, _task_set: &mut FutureSet<Self>, _state: &mut Self::State) {
+        self.active = false;
+    }
+
+    fn after_sync(&self, task_set: &mut FutureSet<Self>) {
+        if self.active && task_set.is_empty() {
+            self.spawn_status_check(
+                task_set,
+                CoreType::Mihomo,
+                std::time::Duration::from_secs(2),
+            );
+        }
     }
 }
 
@@ -240,12 +270,6 @@ impl TabContent for SrvCtlContent {
         }
         self.mihomo_is_user = cfg.mihomo.core_service.is_user;
 
-        self.singbox_service_name = cfg.singbox.core_service.service_name.clone();
-        if self.singbox_service_name.is_empty() {
-            self.singbox_service_name = "clashtui_singbox".to_owned();
-        }
-        self.singbox_is_user = cfg.singbox.core_service.is_user;
-
         match crate::config::CONFIG.core_type() {
             CoreType::Mihomo => {
                 self.service_name = self.mihomo_service_name.clone();
@@ -256,19 +280,9 @@ impl TabContent for SrvCtlContent {
                 self.is_user = self.mihomo_is_user;
                 self.core_label = "mihomo".to_owned();
             }
-            CoreType::Singbox => {
-                self.service_name = self.singbox_service_name.clone();
-                self.bin_path = cfg.singbox.core.bin_path.clone();
-                if self.bin_path.is_empty() {
-                    self.bin_path = "/usr/bin/sing-box".to_owned();
-                }
-                self.is_user = self.singbox_is_user;
-                self.core_label = "sing-box".to_owned();
-            }
         }
         self.status = "...".to_owned();
         self.mihomo_status = "...".to_owned();
-        self.singbox_status = "...".to_owned();
         #[cfg(windows)]
         {
             self.proxy_enabled =
@@ -277,8 +291,7 @@ impl TabContent for SrvCtlContent {
         if !self.ops.is_empty() {
             state.select(Some(0));
         }
-        self.spawn_status_check(task_set, CoreType::Mihomo);
-        self.spawn_status_check(task_set, CoreType::Singbox);
+        self.spawn_status_check(task_set, CoreType::Mihomo, std::time::Duration::ZERO);
     }
 
     fn handle_key_event(
@@ -323,7 +336,7 @@ impl TabContent for SrvCtlContent {
                                             c.status = s.clone();
                                             match crate::config::CONFIG.core_type() {
                                                 CoreType::Mihomo => c.mihomo_status = s,
-                                                CoreType::Singbox => c.singbox_status = s,
+
                                             }
                                         })
                                     }
@@ -355,91 +368,27 @@ impl TabContent for SrvCtlContent {
                     }
 
                     match op {
+                        SrvCtlOp::RestartApi | SrvCtlOp::UpgradeCore => {
+                            if crate::config::CONFIG.core_type() != CoreType::Mihomo {
+                                crate::tui::widget::popmsg::Confirm::err("This core does not support the Mihomo maintenance API");
+                                return do_nothing();
+                            }
+                            if crate::tui::widget::popmsg::Confirm::title(format!("{}?", op.as_str()))
+                                .with_prompt("The core may restart and interrupt active connections. Enter confirms; Esc cancels.".to_owned())
+                                .build_and_send().await.is_err() { return do_nothing(); }
+                            let result = crate::functions::restful::session::spawn_blocking(move || {
+                                if op == SrvCtlOp::RestartApi { crate::functions::restful::control::restart(None) } else { crate::functions::restful::control::upgrade() }
+                            }).await.unwrap().map(|_| "Core accepted the maintenance request. Refresh Status to verify the running version.".to_owned());
+                            handle!(result)
+                        }
                         SrvCtlOp::Stop => {
                             handle!(crate::functions::command::stop_service(), "inactive")
                         }
                         SrvCtlOp::Restart => {
                             handle!(crate::functions::command::restart_service(), "active")
                         }
-                        SrvCtlOp::StopAll => {
-                            handle!(crate::functions::command::stop_all_services(), "inactive")
-                        }
-                        SrvCtlOp::SwitchCore => {
-                            let old_type = crate::config::CONFIG.core_type();
-                            let new_type = match old_type {
-                                CoreType::Mihomo => CoreType::Singbox,
-                                CoreType::Singbox => CoreType::Mihomo,
-                            };
-                            let new_label = match new_type {
-                                CoreType::Mihomo => "mihomo",
-                                CoreType::Singbox => "sing-box",
-                            };
-
-                            // stop all core services first
-                            let stop_result = crate::functions::command::stop_all_services();
-
-                            let res = {
-                                crate::config::CONFIG.data.lock().unwrap().core_type = new_type;
-                                crate::config::CONFIG.save()
-                            };
-                            match res {
-                                Ok(()) => {
-                                    // start the target core
-                                    let start_result =
-                                        crate::functions::command::start_core_service(new_type);
-
-                                    let status_msg = format!(
-                                        "Core switched to {new_label}\n\n\
-                                         Stop all services: {stop}\n\
-                                         Start {new_label}: {start}",
-                                        stop = stop_result
-                                            .as_ref()
-                                            .map(|s| s.as_str())
-                                            .unwrap_or("?")
-                                            .trim(),
-                                        start = start_result
-                                            .as_ref()
-                                            .map(|s| s.as_str())
-                                            .unwrap_or("?")
-                                            .trim(),
-                                    );
-
-                                    let update_label = wrapper(move |c: &mut SrvCtlContent| {
-                                        c.core_label = new_label.to_owned();
-                                        if start_result.is_ok() {
-                                            match new_type {
-                                                CoreType::Mihomo => {
-                                                    c.mihomo_status = "active".to_owned();
-                                                    c.singbox_status = "inactive".to_owned();
-                                                }
-                                                CoreType::Singbox => {
-                                                    c.mihomo_status = "inactive".to_owned();
-                                                    c.singbox_status = "active".to_owned();
-                                                }
-                                            }
-                                        }
-                                        c.status = match new_type {
-                                            CoreType::Mihomo => c.mihomo_status.clone(),
-                                            CoreType::Singbox => c.singbox_status.clone(),
-                                        };
-                                    });
-
-                                    let _ = crate::tui::widget::popmsg::Confirm::dismiss_any(
-                                        "Core Switched".to_owned(),
-                                    )
-                                    .with_prompt(status_msg)
-                                    .build_and_send()
-                                    .await;
-
-                                    crate::tui::app::QUIT
-                                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    update_label
-                                }
-                                Err(e) => {
-                                    crate::tui::widget::popmsg::Confirm::err(e);
-                                    do_nothing()
-                                }
-                            }
+                        SrvCtlOp::Start => {
+                            handle!(crate::functions::command::start_core_service(CoreType::Mihomo), "active")
                         }
                         #[cfg(windows)]
                         SrvCtlOp::Install => {
@@ -505,22 +454,9 @@ impl TabContent for SrvCtlContent {
             "► {}: {}",
             match crate::config::CONFIG.core_type() {
                 CoreType::Mihomo => "mihomo",
-                CoreType::Singbox => "sing-box",
             },
             match crate::config::CONFIG.core_type() {
                 CoreType::Mihomo => &self.mihomo_status,
-                CoreType::Singbox => &self.singbox_status,
-            }
-        );
-        let other_core_label = format!(
-            "  {}: {}",
-            match crate::config::CONFIG.core_type() {
-                CoreType::Mihomo => "sing-box",
-                CoreType::Singbox => "mihomo",
-            },
-            match crate::config::CONFIG.core_type() {
-                CoreType::Mihomo => &self.singbox_status,
-                CoreType::Singbox => &self.mihomo_status,
             }
         );
 
@@ -540,16 +476,10 @@ impl TabContent for SrvCtlContent {
             .title(title_line)
             .title_bottom({
                 #[cfg_attr(not(windows), allow(unused_mut))]
-                let mut spans = vec![
-                    ratatui::text::Span::styled(
-                        format!(" {} ", current_core_label),
-                        section.border,
-                    ),
-                    ratatui::text::Span::styled(
-                        format!(" {} ", other_core_label),
-                        section.border.fg(Color::Rgb(100, 100, 100)),
-                    ),
-                ];
+                let mut spans = vec![ratatui::text::Span::styled(
+                    format!(" {} ", current_core_label),
+                    section.border,
+                )];
                 #[cfg(windows)]
                 spans.push(ratatui::text::Span::styled(
                     format!(" {} ", proxy_label),
@@ -629,18 +559,11 @@ mod tests {
         assert!(!ops.is_empty());
         assert!(ops.contains(&SrvCtlOp::Stop));
         assert!(ops.contains(&SrvCtlOp::Restart));
-        assert!(ops.contains(&SrvCtlOp::SwitchCore));
-        assert!(ops.contains(&SrvCtlOp::StopAll));
     }
 
     #[test]
     fn srvctl_op_as_str_returns_non_empty() {
-        for op in [
-            SrvCtlOp::Stop,
-            SrvCtlOp::Restart,
-            SrvCtlOp::SwitchCore,
-            SrvCtlOp::StopAll,
-        ] {
+        for op in [SrvCtlOp::Stop, SrvCtlOp::Restart] {
             assert!(!op.as_str().is_empty());
         }
     }

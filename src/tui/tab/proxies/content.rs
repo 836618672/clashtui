@@ -20,6 +20,35 @@ pub struct Proxies {
 type SelectionKey = (String, Option<String>, NodeType);
 
 impl Proxies {
+    pub(crate) fn visible_indices(&self) -> Vec<usize> {
+        self.tree
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| {
+                self.filter
+                    .as_deref()
+                    .is_none_or(|pat| node.name.to_lowercase().contains(&pat.to_lowercase()))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    pub(crate) fn normalize_cursor(&self, state: &mut ListState) -> Vec<usize> {
+        let visible = self.visible_indices();
+        let current = state.selected().unwrap_or(0);
+        if !visible.contains(&current) {
+            state.select(
+                visible
+                    .iter()
+                    .copied()
+                    .find(|&index| index >= current)
+                    .or_else(|| visible.last().copied()),
+            );
+        }
+        visible
+    }
+
     fn resolve_group_for_sort(&self, cursor: usize) -> Option<String> {
         let node = self.tree.node_at(cursor)?;
         match node.node_type {
@@ -78,29 +107,29 @@ impl Proxies {
         task_set: &mut FutureSet<Self>,
         state: &mut ListState,
     ) {
+        let visible = self.normalize_cursor(state);
+        if visible.is_empty() && !matches!(key, super::Key::Search | super::Key::Refresh) {
+            return;
+        }
         let current = state.selected().unwrap_or(0);
+        let position = visible
+            .iter()
+            .position(|&index| index == current)
+            .unwrap_or(0);
 
         match key {
             super::Key::MoveUp => {
-                if current > 0 {
-                    state.select(Some(current - 1));
-                }
+                state.select(visible.get(position.saturating_sub(1)).copied());
             }
             super::Key::MoveDown => {
-                if current + 1 < self.tree.len() {
-                    state.select(Some(current + 1));
-                }
+                state.select(
+                    visible
+                        .get((position + 1).min(visible.len().saturating_sub(1)))
+                        .copied(),
+                );
             }
-            super::Key::GoTop => {
-                if !self.tree.is_empty() {
-                    state.select(Some(0));
-                }
-            }
-            super::Key::GoBottom => {
-                if !self.tree.is_empty() {
-                    state.select(Some(self.tree.len().saturating_sub(1)));
-                }
-            }
+            super::Key::GoTop => state.select(visible.first().copied()),
+            super::Key::GoBottom => state.select(visible.last().copied()),
             super::Key::Parent => {
                 let info = self.tree.node_at(current).map(|n| n.parent.clone());
                 if let Some(Some(ref parent)) = info
@@ -153,6 +182,29 @@ impl Proxies {
                 let key = self.selection_key(state);
                 self.tree.expand_all(&self.proxies);
                 self.restore_selection(key, state);
+            }
+            super::Key::Unfix => {
+                if let Some(group) = self.resolve_group_for_sort(current) {
+                    async move {
+                        let response = crate::functions::restful::session::spawn_blocking(
+                            move || -> anyhow::Result<_> {
+                                crate::functions::restful::proxies::unfix_proxy(&group)?;
+                                Ok(crate::functions::restful::proxies::fetch_proxies()?)
+                            },
+                        )
+                        .await;
+                        wrapper(move |content: &mut Self| match response {
+                            Ok(Ok(response)) => {
+                                content.proxies = response.proxies;
+                                content.tree.rebuild_from_proxies(&content.proxies);
+                                content.error = None;
+                            }
+                            Ok(Err(error)) => content.error = Some(error.to_string()),
+                            Err(error) => content.error = Some(error.to_string()),
+                        })
+                    }
+                    .spawn_at(task_set);
+                }
             }
             super::Key::Refresh => self.refresh(task_set),
             super::Key::SortByName => {
@@ -314,16 +366,16 @@ impl BasicTabContent for Proxies {
     }
 
     fn after_sync(&self, task_set: &mut FutureSet<Self>) {
+        if !task_set.is_empty() {
+            return;
+        }
         if self.paused {
             return;
         }
-        if crate::config::is_core_mismatch() {
-            return;
-        }
         async {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             let response = tri!(
-                tokio::task::spawn_blocking(proxies::fetch_proxies)
+                crate::functions::restful::session::spawn_blocking(proxies::fetch_proxies)
                     .await
                     .unwrap(),
                 or_set
@@ -339,15 +391,9 @@ impl BasicTabContent for Proxies {
 
     fn on_enter(&mut self, task_set: &mut FutureSet<Self>, _state: &mut Self::State) {
         self.paused = false;
-        if crate::config::is_core_mismatch() {
-            self.proxies = IndexMap::new();
-            self.tree = ProxyTree::default();
-            self.error = Some("API data mismatch with configured core".to_owned());
-            return;
-        }
         async {
             let response = tri!(
-                tokio::task::spawn_blocking(proxies::fetch_proxies)
+                crate::functions::restful::session::spawn_blocking(proxies::fetch_proxies)
                     .await
                     .unwrap()
             );
@@ -413,6 +459,35 @@ mod tests {
         let mut state = ListState::default();
         state.select(Some(0));
         (content, state)
+    }
+
+    #[test]
+    fn filtered_redraw_preserves_tree_action_target() {
+        let (mut content, mut state) = load_fixture();
+        let (index, name) = content
+            .tree
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(index, node)| *index > 0 && node.node_type == NodeType::Folder)
+            .map(|(index, node)| (index, node.name.clone()))
+            .unwrap();
+        content.filter = Some(name.clone());
+        state.select(Some(index));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        for _ in 0..3 {
+            terminal
+                .draw(|frame| {
+                    super::super::render::render(&content, frame, frame.area(), &mut state)
+                })
+                .unwrap();
+            assert_eq!(state.selected(), Some(index));
+            assert_eq!(content.selection_key(&state).unwrap().0, name);
+        }
+        content.filter = Some("no-such-proxy".to_owned());
+        content.normalize_cursor(&mut state);
+        assert!(state.selected().is_none());
     }
 
     #[test]

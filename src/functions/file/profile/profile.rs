@@ -5,15 +5,8 @@ use crate::config::database::{Profile, ProfileType};
 
 impl Profile {
     pub fn load_local_profile(self) -> anyhow::Result<LocalProfile> {
-        use super::super::PROFILE_JSONS_PATH;
         use super::PROFILE_YAMLS_PATH;
-        let path = if matches!(self.dtype, ProfileType::Singbox)
-            || crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox
-        {
-            PROFILE_JSONS_PATH.join(format!("{}.json", self.name))
-        } else {
-            PROFILE_YAMLS_PATH.join(format!("{}.yaml", self.name))
-        };
+        let path = PROFILE_YAMLS_PATH.join(format!("{}.yaml", self.name));
         let mut lpf = LocalProfile::from_pf(self, path);
         lpf.sync_from_disk()?;
         Ok(lpf)
@@ -78,13 +71,6 @@ impl LocalProfile {
         }
         Ok(())
     }
-    /// sync the content to disk by [`LocalProfile::path`]
-    pub fn sync_to_disk(self) -> anyhow::Result<()> {
-        let LocalProfile { path, content, .. } = self;
-        let fp = File::create(path)
-            .map_err(|e| anyhow::anyhow!("Failed to write clash config file: {e}"))?;
-        Ok(serde_yml::to_writer(fp, &content)?)
-    }
     pub fn from_pf(pf: Profile, path: std::path::PathBuf) -> Self {
         let Profile { name, dtype, .. } = pf;
         Self {
@@ -107,7 +93,7 @@ impl LocalProfile {
 impl ProfileType {
     pub fn get_domain(&self) -> Option<String> {
         match self {
-            ProfileType::File | ProfileType::Singbox | ProfileType::Template { .. } => None,
+            ProfileType::File | ProfileType::Template { .. } => None,
             ProfileType::Url(url) => extract_domain(url).map(|s| s.to_owned()),
         }
     }

@@ -9,7 +9,7 @@ tcp-concurrent: true    # When domain has multiple IPs, attempt TCP handshake co
 secret: ""
 external-controller: 127.0.0.1:9090
 external-ui: uis/metacubexd
-external-ui-url: https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip
+external-ui-url: https://github.com/MetaCubeX/metacubexd/releases/download/v1.273.1/compressed-dist.tgz
 
 #geodata-mode: true
 #geox-url:

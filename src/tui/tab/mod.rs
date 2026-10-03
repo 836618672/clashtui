@@ -271,6 +271,7 @@ pub(crate) mod connections;
 pub(crate) mod files;
 pub(crate) mod logs;
 pub(crate) mod proxies;
+pub(crate) mod resources;
 pub(crate) mod settings;
 pub(crate) mod srvctl;
 mod status;
@@ -351,6 +352,7 @@ pub mod prelude {
     pub use super::files::FileTab;
     pub use super::logs::LogsTab;
     pub use super::proxies::ProxiesTab;
+    pub use super::resources::{ProvidersTab, RulesTab};
     pub use super::settings::SettingsTab;
     pub use super::srvctl::CoreSrvCtlTab;
     pub use super::status::StatusTab;
@@ -393,6 +395,8 @@ pub mod prelude {
         init_section!(keymap, "srvctl", srvctl);
         init_section!(keymap, "settings", settings);
         init_section!(keymap, "logs", logs);
+        init_section!(keymap, "resources", resources);
+        init_section!(keymap, "status", status);
 
         // FileTab has nested sections — delegate to files::agent_init
         if let Some(section_val) = crate::tui::agent::take_section(keymap, "file") {
@@ -420,6 +424,8 @@ pub mod prelude {
             CoreSrvCtlTab,
             StatusTab,
             LogsTab,
+            RulesTab,
+            ProvidersTab,
         }
     );
 }

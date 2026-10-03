@@ -1,29 +1,48 @@
 #[allow(clippy::module_inception)]
 mod profile;
 
-use super::PROFILE_JSONS_PATH;
 use super::PROFILE_YAMLS_PATH;
+use super::net_resource::{ExtractNetResources, ResourceSection};
 use crate::config::database::{Profile, ProfileType};
 
 pub mod db {
     use super::*;
 
-    pub fn create(name: impl AsRef<str>, url: impl AsRef<str>) -> anyhow::Result<Profile> {
-        let mut pm = pm!();
-        pm.insert(&name, ProfileType::Url(url.as_ref().to_owned()));
-        pm.to_file()?;
-        Ok(pm.get(name).unwrap())
-    }
     pub fn remove(pf: Profile) -> anyhow::Result<()> {
+        let _write = super::super::coordination::WriteGuard::acquire()?;
         let path = local_profile_path(&pf.name);
+        let mut pm = pm!();
+        pm.ensure_loaded()?;
+        anyhow::ensure!(
+            pm.get_current()
+                .is_none_or(|current| current.name != pf.name),
+            "Select another profile before deleting the active profile"
+        );
+        anyhow::ensure!(pm.get(&pf.name).is_some(), "Profile no longer exists");
+        let previous = match std::fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
         if let Err(e) = std::fs::remove_file(&path)
             && e.kind() != std::io::ErrorKind::NotFound
         {
             return Err(e.into());
         }
-        let mut pm = pm!();
-        pm.remove(pf.name);
-        pm.to_file()
+        let old = pm.clone();
+        pm.remove(&pf.name);
+        if let Err(error) = pm.to_file() {
+            *pm = old;
+            if let Some(bytes) = previous {
+                super::super::activation::atomic_write(&path, &bytes).map_err(|recovery| {
+                    anyhow::anyhow!(
+                        "Delete failed: {error}; restoring profile file failed: {recovery}"
+                    )
+                })?;
+            }
+            return Err(error.context("Delete failed; profile file preserved"));
+        }
+        Ok(())
     }
     pub fn get(name: impl AsRef<str>) -> Option<Profile> {
         pm!().get(name)
@@ -40,6 +59,10 @@ pub mod db {
     }
     pub fn set_current(pf: Profile) -> anyhow::Result<()> {
         let mut pm = pm!();
+        anyhow::ensure!(
+            pm.get(&pf.name).is_some(),
+            "Profile was removed before activation; refresh and retry"
+        );
         pm.set_current(pf);
         pm.to_file()
     }
@@ -67,7 +90,6 @@ pub mod db {
 pub fn local_profile_path(name: &str) -> std::path::PathBuf {
     match crate::config::CONFIG.core_type() {
         crate::config::CoreType::Mihomo => PROFILE_YAMLS_PATH.join(format!("{name}.yaml")),
-        crate::config::CoreType::Singbox => PROFILE_JSONS_PATH.join(format!("{name}.json")),
     }
 }
 
@@ -101,9 +123,12 @@ pub fn validate_subscription_url(url: &str) -> anyhow::Result<()> {
 /// Save metadata without downloading or applying a configuration. Renaming keeps
 /// the cached profile and current selection; failure leaves the old entry intact.
 pub fn edit_profile(old_name: &str, new_name: &str, url: Option<&str>) -> anyhow::Result<()> {
+    let _write = super::coordination::WriteGuard::acquire()?;
     let path = local_profile_path(old_name);
+    let mut database = pm!();
+    database.ensure_loaded()?;
     edit_profile_in(
-        &mut pm!(),
+        &mut database,
         path.parent().unwrap(),
         &crate::config::config_dir_path().join("clashtui.db"),
         old_name,
@@ -147,7 +172,6 @@ fn edit_profile_in(
     }
     let extension = match pm.core_type {
         crate::config::CoreType::Mihomo => "yaml",
-        crate::config::CoreType::Singbox => "json",
     };
     let old_path = profile_dir.join(format!("{old_name}.{extension}"));
     let new_path = profile_dir.join(format!("{new_name}.{extension}"));
@@ -158,14 +182,16 @@ fn edit_profile_in(
             new_path.display()
         );
     }
-    let tmp = db_path.with_extension("db.edit.tmp");
-    std::fs::write(&tmp, serde_yml::to_string(&next)?)?;
+    let tmp = super::activation::TemporaryFile::create_beside(
+        db_path,
+        serde_yml::to_string(&next)?.as_bytes(),
+    )?;
     let moved = old_name != new_name && old_path.exists();
     let commit = (|| -> anyhow::Result<()> {
         if moved {
             std::fs::rename(&old_path, &new_path).context("Failed to rename profile file")?;
         }
-        if let Err(err) = std::fs::rename(&tmp, db_path) {
+        if let Err(err) = std::fs::rename(&tmp.0, db_path) {
             if moved {
                 std::fs::rename(&new_path, &old_path)
                     .context("Failed to restore profile file after database save failed")?;
@@ -174,102 +200,46 @@ fn edit_profile_in(
         }
         Ok(())
     })();
-    if commit.is_err() {
-        let _ = std::fs::remove_file(tmp);
-    }
+    drop(tmp);
     commit?;
     *pm = next;
     Ok(())
 }
 
-pub fn import_profile_from_file(source_path: &str, profile_name: &str) -> anyhow::Result<Profile> {
-    validate_profile_name(profile_name)?;
-    let source = std::path::Path::new(source_path);
-    anyhow::ensure!(source.exists(), "Source file not found: {source_path}");
-    anyhow::ensure!(source.is_file(), "Source path is not a file: {source_path}");
-
-    let is_json = source
-        .extension()
-        .map(|e| e.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
-
-    if is_json {
-        anyhow::ensure!(
-            crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox,
-            "Switch to sing-box before importing a JSON profile"
-        );
-        return import_singbox_profile(source, profile_name);
-    }
-
-    let content: serde_yml::Mapping = {
-        let file = std::fs::File::open(source)?;
-        serde_yml::from_reader(file)
-            .map_err(|e| anyhow::anyhow!("Invalid YAML in source file: {e}"))?
-    };
-    anyhow::ensure!(
-        content.get("proxies").is_some_and(|v| v.is_sequence())
-            || content
-                .get("proxy-providers")
-                .is_some_and(|v| v.is_mapping()),
-        "Not a valid clash YAML file"
-    );
-
-    let dest = PROFILE_YAMLS_PATH.join(format!("{profile_name}.yaml"));
-    if dest.exists() {
-        anyhow::bail!("Profile '{profile_name}' already exists in profile_yamls/");
-    }
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::copy(source, &dest)?;
-
-    let mut pm = pm!();
-    pm.insert(profile_name, ProfileType::File);
-    pm.to_file()?;
-    Ok(pm.get(profile_name).unwrap())
-}
-
-fn import_singbox_profile(source: &std::path::Path, profile_name: &str) -> anyhow::Result<Profile> {
-    let file = std::fs::File::open(source)?;
-    let content: serde_json::Value = serde_json::from_reader(file)
-        .map_err(|e| anyhow::anyhow!("Invalid JSON in source file: {e}"))?;
-
-    anyhow::ensure!(
-        content.get("outbounds").is_some_and(|v| v.is_array()),
-        "Not a valid sing-box JSON profile (missing 'outbounds' array)"
-    );
-
-    if let Some(parent) = PROFILE_JSONS_PATH.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::create_dir_all(&*PROFILE_JSONS_PATH)?;
-
-    let dest = PROFILE_JSONS_PATH.join(format!("{profile_name}.json"));
-    if dest.exists() {
-        anyhow::bail!("Profile '{profile_name}' already exists in profile_jsons/");
-    }
-    std::fs::copy(source, &dest)?;
-
-    let mut pm = pm!();
-    pm.insert(profile_name, ProfileType::Singbox);
-    pm.to_file()?;
-    Ok(pm.get(profile_name).unwrap())
-}
-
+// Import registration is centralized in functions::management for all clients.
 pub struct UpdateResult {
     pub name: String,
     pub net_updates: Vec<crate::functions::file::net_resource::NetResourceUpdate>,
 }
 
 pub async fn update_profile(profile: Profile, with_proxy: bool) -> anyhow::Result<UpdateResult> {
+    super::coordination::transaction(move || async move {
+        validate_registered_profile(&profile)?;
+        update_profile_locked(profile, with_proxy).await
+    })
+    .await
+}
+
+fn validate_registered_profile(profile: &Profile) -> anyhow::Result<()> {
+    let db = super::coordination::database();
+    db.ensure_loaded()?;
+    let current = db
+        .get(&profile.name)
+        .ok_or_else(|| anyhow::anyhow!("Profile was removed or renamed; refresh and retry"))?;
+    anyhow::ensure!(
+        current.dtype == profile.dtype
+            && current.no_pp == profile.no_pp
+            && current.update_with_proxy == profile.update_with_proxy,
+        "Profile changed; refresh and retry"
+    );
+    Ok(())
+}
+
+async fn update_profile_locked(profile: Profile, with_proxy: bool) -> anyhow::Result<UpdateResult> {
     use super::template::fetch_net_resource_statuses;
 
     let result = if matches!(profile.dtype, ProfileType::Template { .. }) {
         update_template_profile(profile.clone(), with_proxy).await
-    } else if matches!(profile.dtype, ProfileType::Singbox)
-        || crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox
-    {
-        update_singbox_profile(profile.clone(), with_proxy).await
     } else {
         let path = PROFILE_YAMLS_PATH.join(format!("{}.yaml", profile.name));
 
@@ -280,7 +250,7 @@ pub async fn update_profile(profile: Profile, with_proxy: bool) -> anyhow::Resul
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            serde_yml::to_writer(std::fs::File::create(&path)?, &content)?;
+            super::activation::atomic_write(&path, serde_yml::to_string(&content)?.as_bytes())?;
         }
 
         anyhow::ensure!(
@@ -296,254 +266,77 @@ pub async fn update_profile(profile: Profile, with_proxy: bool) -> anyhow::Resul
         };
 
         let net_updates = fetch_net_resource_statuses(&content, with_proxy).await;
-        serde_yml::to_writer(std::fs::File::create(&path)?, &content)?;
         Ok(UpdateResult {
             name: profile.name.clone(),
             net_updates,
         })
     };
 
-    if result.is_ok() {
+    if result
+        .as_ref()
+        .is_ok_and(|result| result.net_updates.iter().all(|resource| resource.ok))
+    {
         let cur = db::get_current();
         if cur.name == profile.name {
-            let _ = select(profile).await;
+            select_locked(profile).await.map_err(|error| {
+                anyhow::anyhow!("Subscription updated, but activation failed: {error:#}")
+            })?;
         }
     }
 
     result
 }
 
-async fn update_singbox_profile(
+fn apply_generated_config(
+    out_path: &std::path::Path,
+    bytes: &[u8],
     profile: Profile,
-    with_proxy: bool,
-) -> anyhow::Result<UpdateResult> {
-    let path = PROFILE_JSONS_PATH.join(format!("{}.json", profile.name));
-
-    if let ProfileType::Url(ref url) = profile.dtype {
-        let mut response = crate::functions::restful::download::profile(url, with_proxy)?;
-        let content: serde_json::Value = serde_json::from_reader(&mut response)
-            .map_err(|e| anyhow::anyhow!("Failed to parse downloaded profile JSON: {e}"))?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = std::fs::File::create(&path)?;
-        serde_json::to_writer_pretty(file, &content)?;
-    }
-
-    anyhow::ensure!(
-        path.exists(),
-        "Profile file not found: {}. Download it first.",
-        path.display()
-    );
-
-    let content: serde_json::Value = {
-        let file = std::fs::File::open(&path)?;
-        serde_json::from_reader(file)
-            .map_err(|e| anyhow::anyhow!("Failed to read profile JSON: {e}"))?
-    };
-
-    let net_resources =
-        crate::functions::file::net_resource::extract_singbox_net_resources(&content);
-    let base_dir = std::path::Path::new(&crate::config::CONFIG.cfg_file.singbox.core.config_dir);
-    let net_updates = crate::functions::file::template::fetch_net_resource_statuses_from_resources(
-        &net_resources,
-        base_dir,
-        with_proxy,
+) -> anyhow::Result<()> {
+    let mapping: serde_yml::Mapping = serde_yml::from_slice(bytes)?;
+    super::net_resource::validate_cache_paths(&mapping)?;
+    let core = crate::config::CONFIG.core_type();
+    let expected = super::evidence::parse(bytes, core)?;
+    super::evidence::validate_endpoint(
+        &expected,
+        core,
+        crate::config::CONFIG.controller_for_core(),
+        crate::config::CONFIG.secret_for_core(),
+    )?;
+    let mut recovering = false;
+    super::activation::activate(
+        out_path,
+        bytes,
+        crate::functions::command::check_config,
+        |path| {
+            let on_disk = super::evidence::parse(&std::fs::read(path)?, core)?;
+            let result = crate::functions::restful::config::reload(path.display().to_string())
+                .map_err(anyhow::Error::from)
+                .and_then(|_| super::evidence::verify(&on_disk, core));
+            let recovery_attempt = recovering;
+            recovering = true;
+            if recovery_attempt && result.is_err() {
+                crate::functions::command::restart_service()?;
+                crate::functions::restful::config::wait_until_ready()?;
+                super::evidence::verify(&on_disk, core)
+            } else {
+                result
+            }
+        },
+        || db::set_current(profile),
     )
-    .await;
-
-    Ok(UpdateResult {
-        name: profile.name,
-        net_updates,
-    })
 }
 
 async fn update_template_profile(
     profile: Profile,
     with_proxy: bool,
 ) -> anyhow::Result<UpdateResult> {
-    use crate::functions::file::net_resource::{
-        ExtractNetResources, NetResourceUpdate, ResourceSection,
-    };
-
-    let template = match &profile.dtype {
-        ProfileType::Template { template } => template.clone(),
-        _ => anyhow::bail!("update_template_profile called on non-Template profile"),
-    };
-
-    // Read proxy-provider URLs from the generated profile file
-    let groups = super::template::read_profile_ppg(&profile.name).unwrap_or_default();
-
-    let is_singbox = crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox;
-    let mut statuses: Vec<NetResourceUpdate> = Vec::new();
-
-    if is_singbox {
-        // For sing-box, download proxy-provider subscription content to proxy-providers dir
-        let mut download_handles = Vec::new();
-        for providers in groups.values() {
-            for (name, url) in providers {
-                let url = url.clone();
-                let name = name.clone();
-                let hash = format!("{:x}", md5::compute(url.as_bytes()));
-                let path =
-                    crate::config::singbox_proxy_providers_path().join(format!("{hash}.json"));
-                download_handles.push(tokio::task::spawn_blocking(move || {
-                    match crate::functions::restful::download::profile(&url, with_proxy) {
-                        Ok(mut rdr) => {
-                            let mut buf = Vec::new();
-                            if let Err(e) = std::io::Read::read_to_end(&mut rdr, &mut buf) {
-                                return (name, url, path, false, Some(e.to_string()));
-                            }
-                            if let Some(parent) = path.parent()
-                                && let Err(e) = std::fs::create_dir_all(parent)
-                            {
-                                return (name, url, path, false, Some(e.to_string()));
-                            }
-                            match std::fs::write(&path, &buf) {
-                                Ok(()) => (name, url, path, true, None),
-                                Err(e) => (name, url, path, false, Some(e.to_string())),
-                            }
-                        }
-                        Err(e) => {
-                            if path.exists() {
-                                (name, url, path, true, None)
-                            } else {
-                                (name, url, path, false, Some(e.to_string()))
-                            }
-                        }
-                    }
-                }));
-            }
-        }
-
-        for handle in download_handles {
-            let (name, url, path, ok, error) = handle.await?;
-            statuses.push(NetResourceUpdate {
-                name,
-                url,
-                path: path.display().to_string(),
-                section: ResourceSection::ProxyProvider,
-                ok,
-                error,
-            });
-        }
-    } else {
-        let cfg_dir =
-            std::path::PathBuf::from(&crate::config::CONFIG.cfg_file.mihomo.core.config_dir);
-        let _tpl_name = std::path::Path::new(&template)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&template);
-
-        // Collect URLs from both proxy-provider groups and standalone providers.
-        // Standalone proxy-providers (with own `url`, no `tpl_param`) are not in
-        // clashtui.proxy_provider_groups but need to be pre-downloaded as well.
-        let mut download_urls: Vec<(String, String)> = Vec::new();
-        for providers in groups.values() {
-            for (name, url) in providers {
-                download_urls.push((name.clone(), url.clone()));
-            }
-        }
-
-        // Also extract standalone proxy-provider URLs from the generated profile
-        let profile_path = super::PROFILE_YAMLS_PATH.join(format!("{}.yaml", profile.name));
-        if let Ok(content) = std::fs::read_to_string(&profile_path)
-            && let Ok(mapping) = serde_yml::from_str::<serde_yml::Mapping>(&content)
-        {
-            for resource in mapping.extract(&[ResourceSection::ProxyProvider]) {
-                let already_in_groups = groups
-                    .values()
-                    .flat_map(|providers| providers.values())
-                    .any(|url| url == &resource.url);
-                if !already_in_groups {
-                    download_urls.push((resource.name, resource.url));
-                }
-            }
-        }
-
-        let mut download_handles = Vec::new();
-        for (name, url) in download_urls {
-            let url = url.clone();
-            let name = name.clone();
-            let hash = format!("{:x}", md5::compute(url.as_bytes()));
-            let path = cfg_dir.join(format!("proxies/{hash}"));
-            download_handles.push(tokio::task::spawn_blocking(move || {
-                match crate::functions::restful::download::profile(&url, with_proxy) {
-                    Ok(mut rdr) => {
-                        let mut buf = Vec::new();
-                        if let Err(e) = std::io::Read::read_to_end(&mut rdr, &mut buf) {
-                            return (name, url, path, false, Some(e.to_string()));
-                        }
-                        if serde_yml::from_slice::<serde_yml::Mapping>(&buf).is_err() {
-                            return (
-                                name,
-                                url,
-                                path,
-                                false,
-                                Some("Invalid YAML format".to_string()),
-                            );
-                        }
-                        if let Some(parent) = path.parent()
-                            && let Err(e) = std::fs::create_dir_all(parent)
-                        {
-                            return (name, url, path, false, Some(e.to_string()));
-                        }
-                        match std::fs::write(&path, &buf) {
-                            Ok(()) => (name, url, path, true, None),
-                            Err(e) => (name, url, path, false, Some(e.to_string())),
-                        }
-                    }
-                    Err(e) => {
-                        if path.exists()
-                            && std::fs::read(&path).is_ok_and(|buf| {
-                                serde_yml::from_slice::<serde_yml::Mapping>(&buf).is_ok()
-                            })
-                        {
-                            (name, url, path, true, None)
-                        } else {
-                            (name, url, path, false, Some(e.to_string()))
-                        }
-                    }
-                }
-            }));
-        }
-
-        let mut all_ok = true;
-        for handle in download_handles {
-            let (name, url, path, ok, error) = handle.await?;
-            if !ok {
-                all_ok = false;
-            }
-            statuses.push(NetResourceUpdate {
-                name,
-                url,
-                path: path.display().to_string(),
-                section: ResourceSection::ProxyProvider,
-                ok,
-                error,
-            });
-        }
-
-        if !all_ok {
-            let failures: Vec<String> = statuses
-                .iter()
-                .filter(|s| !s.ok)
-                .map(|s| {
-                    format!(
-                        "  {}: {} — {}",
-                        s.name,
-                        extract_domain(&s.url).unwrap_or(&s.url),
-                        s.error.as_deref().unwrap_or("unknown error")
-                    )
-                })
-                .collect();
-            anyhow::bail!(
-                "Failed to download proxy providers:\n{}",
-                failures.join("\n")
-            );
-        }
-    }
-
+    anyhow::ensure!(
+        matches!(profile.dtype, ProfileType::Template { .. }),
+        "Expected template profile"
+    );
+    let path = super::PROFILE_YAMLS_PATH.join(format!("{}.yaml", profile.name));
+    let mapping: serde_yml::Mapping = serde_yml::from_slice(&std::fs::read(path)?)?;
+    let statuses = super::template::fetch_net_resource_statuses(&mapping, with_proxy).await;
     Ok(UpdateResult {
         name: profile.name,
         net_updates: statuses,
@@ -551,6 +344,18 @@ async fn update_template_profile(
 }
 
 pub async fn select(profile: Profile) -> anyhow::Result<()> {
+    super::coordination::transaction(move || async move {
+        validate_registered_profile(&profile)?;
+        select_locked(profile).await
+    })
+    .await
+}
+
+async fn select_locked(profile: Profile) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        crate::functions::management::local_controller(crate::config::CONFIG.controller_for_core()),
+        "Local configuration activation is unavailable for a remote core endpoint"
+    );
     use super::template::{
         check_template_ppg_availability, fetch_net_resource_statuses, update_profile_without_pp,
     };
@@ -558,12 +363,6 @@ pub async fn select(profile: Profile) -> anyhow::Result<()> {
     // For Template profiles, verify proxy-provider files exist before selection
     if matches!(profile.dtype, ProfileType::Template { .. }) {
         check_template_ppg_availability(&profile)?;
-    }
-
-    if matches!(profile.dtype, ProfileType::Singbox)
-        || crate::config::CONFIG.core_type() == crate::config::CoreType::Singbox
-    {
-        return select_singbox(profile).await;
     }
 
     let cfg = &crate::config::CONFIG.cfg_file.mihomo.core;
@@ -576,10 +375,31 @@ pub async fn select(profile: Profile) -> anyhow::Result<()> {
 
     if profile.no_pp {
         let content = lprofile.content.take().unwrap_or_default();
-        let (new_content, _) = update_profile_without_pp(content, false).await?;
+        let (new_content, statuses) = update_profile_without_pp(content, false).await?;
+        anyhow::ensure!(
+            statuses.iter().all(|status| status.ok),
+            "Provider preparation failed:\n{}",
+            super::net_resource::format_net_updates(&statuses)
+        );
         lprofile.content = Some(new_content);
     } else if let Some(ref content) = lprofile.content {
-        fetch_net_resource_statuses(content, false).await;
+        let statuses = fetch_net_resource_statuses(content, false).await;
+        // Downloads may fail offline with a usable old cache. Unsafe paths must
+        // still be rejected before handing the configuration to the core.
+        for resource in content.extract(&[
+            ResourceSection::ProxyProvider,
+            ResourceSection::RuleProvider,
+        ]) {
+            let path = super::net_resource::cache_path(
+                std::path::Path::new(&cfg.config_dir),
+                &resource.path,
+            )?;
+            if statuses.iter().any(|status| {
+                !status.ok && status.name == resource.name && status.section == resource.section
+            }) {
+                resource.validate(&std::fs::read(&path)?, &path)?;
+            }
+        }
     }
 
     rewrite_provider_paths(lprofile.content.as_mut());
@@ -591,11 +411,8 @@ pub async fn select(profile: Profile) -> anyhow::Result<()> {
     }
     let out_path = std::path::absolute(std::path::PathBuf::from(&cfg.config_path))
         .map_err(|e| anyhow::anyhow!("Failed to resolve config path: {e}"))?;
-    lprofile.path = out_path.clone();
-    lprofile.sync_to_disk()?;
-    db::set_current(profile)?;
-    crate::functions::restful::config::reload(out_path.display().to_string())
-        .map_err(|e| anyhow::anyhow!("Config written but reload failed: {e}"))?;
+    let bytes = serde_yml::to_string(&lprofile.content)?.into_bytes();
+    apply_generated_config(&out_path, &bytes, profile)?;
     Ok(())
 }
 
@@ -604,78 +421,6 @@ fn rewrite_provider_paths(_content: Option<&mut serde_yml::Mapping>) {
     // Mihomo resolves relative proxy-provider/rule-provider paths against
     // its config directory, avoiding hard-coded absolute paths that break
     // when config_dir changes (e.g. switching between user/system mode).
-}
-
-fn deep_merge(base: &mut serde_json::Value, overlay: &serde_json::Value) {
-    let serde_json::Value::Object(base_map) = base else {
-        *base = overlay.clone();
-        return;
-    };
-    let serde_json::Value::Object(overlay_map) = overlay else {
-        *base = overlay.clone();
-        return;
-    };
-    for (key, value) in overlay_map {
-        match base_map.get_mut(key.as_str()) {
-            Some(base_value) => deep_merge(base_value, value),
-            None => {
-                base_map.insert(key.clone(), value.clone());
-            }
-        }
-    }
-}
-
-async fn select_singbox(profile: Profile) -> anyhow::Result<()> {
-    let profile_path = super::PROFILE_JSONS_PATH.join(format!("{}.json", profile.name));
-    anyhow::ensure!(
-        profile_path.exists(),
-        "Profile {} file not found: {}. Download it first.",
-        profile.name,
-        profile_path.display()
-    );
-
-    let cfg = &crate::config::CONFIG.cfg_file.singbox.core;
-    let override_path = crate::config::singbox_core_override_path();
-
-    let out_path = std::path::absolute(std::path::PathBuf::from(&cfg.config_path))
-        .map_err(|e| anyhow::anyhow!("Failed to resolve singbox config path: {e}"))?;
-
-    if let Some(parent) = out_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    let profile_content = std::fs::read_to_string(&profile_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read profile {}: {e}", profile_path.display()))?;
-    let mut config: serde_json::Value = serde_json::from_str(&profile_content)
-        .map_err(|e| anyhow::anyhow!("Failed to parse profile {}: {e}", profile_path.display()))?;
-
-    // Strip clashtui metadata before merging into core config
-    if let Some(obj) = config.as_object_mut() {
-        obj.remove("clashtui");
-    }
-
-    if override_path.exists() {
-        let override_content = std::fs::read_to_string(&override_path)
-            .map_err(|e| anyhow::anyhow!("Failed to read core_override_config.json: {e}"))?;
-        let overlay: serde_json::Value = serde_json::from_str(&override_content)
-            .map_err(|e| anyhow::anyhow!("Failed to parse core_override_config.json: {e}"))?;
-        deep_merge(&mut config, &overlay);
-    } else {
-        log::warn!(
-            "core_override_config.json not found at {}, using profile as-is",
-            override_path.display()
-        );
-    }
-
-    let merged_content = serde_json::to_string_pretty(&config)
-        .map_err(|e| anyhow::anyhow!("Failed to serialize merged config: {e}"))?;
-    std::fs::write(&out_path, merged_content)
-        .map_err(|e| anyhow::anyhow!("Failed to write config to {}: {e}", out_path.display()))?;
-
-    db::set_current(profile)?;
-    crate::functions::restful::config::reload(out_path.display().to_string())
-        .map_err(|e| anyhow::anyhow!("Config written but reload failed: {e}"))?;
-    Ok(())
 }
 
 pub fn extract_domain(url: &str) -> Option<&str> {
@@ -724,9 +469,10 @@ mod tests {
     }
 
     #[test]
-    fn editing_subscription_renames_cache_and_current_selection_in_both_cores() {
+    fn editing_subscription_renames_cache_and_current_selection() {
         use crate::config::{CoreType, database::ProfileManager};
-        for (core, extension) in [(CoreType::Mihomo, "yaml"), (CoreType::Singbox, "json")] {
+        {
+            let (core, extension) = (CoreType::Mihomo, "yaml");
             let fixture = EditFixture::new();
             let mut pm = ProfileManager {
                 core_type: core,
@@ -806,12 +552,11 @@ mod tests {
     }
 
     #[test]
-    fn url_can_be_edited_before_download_without_changing_other_core() {
+    fn url_can_be_edited_before_download_without_changing_other_profiles() {
         let fixture = EditFixture::new();
         let mut pm = crate::config::database::ProfileManager::default();
         pm.insert("same", ProfileType::Url("https://mihomo.example".into()));
-        pm.core_type = crate::config::CoreType::Singbox;
-        pm.insert("same", ProfileType::Url("https://singbox.example".into()));
+        pm.insert("other", ProfileType::Url("https://other.example".into()));
         edit_profile_in(
             &mut pm,
             &fixture.0,
@@ -825,126 +570,10 @@ mod tests {
             pm.get("same").unwrap().dtype,
             ProfileType::Url("https://changed.example".into())
         );
-        pm.core_type = crate::config::CoreType::Mihomo;
         assert_eq!(
-            pm.get("same").unwrap().dtype,
-            ProfileType::Url("https://mihomo.example".into())
+            pm.get("other").unwrap().dtype,
+            ProfileType::Url("https://other.example".into())
         );
-    }
-
-    fn merge(base_json: &str, overlay_json: &str) -> serde_json::Value {
-        let mut base: serde_json::Value = serde_json::from_str(base_json).unwrap();
-        let overlay: serde_json::Value = serde_json::from_str(overlay_json).unwrap();
-        deep_merge(&mut base, &overlay);
-        base
-    }
-
-    #[test]
-    fn scalar_overwrite() {
-        let result = merge(r#"{"port": 7890}"#, r#"{"port": 20122}"#);
-        assert_eq!(result["port"], 20122);
-    }
-
-    #[test]
-    fn object_recursive_merge() {
-        let result = merge(
-            r#"{"experimental": {"clash_api": {"external_controller": "0.0.0.0:9090"}}}"#,
-            r#"{"experimental": {"clash_api": {"secret": "abc"}}}"#,
-        );
-        assert_eq!(
-            result["experimental"]["clash_api"]["external_controller"],
-            "0.0.0.0:9090"
-        );
-        assert_eq!(result["experimental"]["clash_api"]["secret"], "abc");
-    }
-
-    #[test]
-    fn array_replaced_entirely() {
-        let result = merge(
-            r#"{"inbounds": [{"type": "mixed", "port": 7890}, {"type": "http", "port": 8080}]}"#,
-            r#"{"inbounds": [{"type": "tun", "stack": "gvisor"}]}"#,
-        );
-        let inbounds = result["inbounds"].as_array().unwrap();
-        assert_eq!(inbounds.len(), 1);
-        assert_eq!(inbounds[0]["type"], "tun");
-    }
-
-    #[test]
-    fn overlay_adds_new_top_level_key() {
-        let result = merge(
-            r#"{"route": {"final": "proxy"}}"#,
-            r#"{"log": {"level": "debug"}}"#,
-        );
-        assert_eq!(result["route"]["final"], "proxy");
-        assert_eq!(result["log"]["level"], "debug");
-    }
-
-    #[test]
-    fn base_only_keys_preserved() {
-        let result = merge(
-            r#"{"route": {"rules": [], "final": "proxy"}, "dns": {}}"#,
-            r#"{"log": {"level": "info"}}"#,
-        );
-        assert!(result["route"]["rules"].is_array());
-        assert_eq!(result["route"]["final"], "proxy");
-        assert!(!result["dns"].is_null()); // empty object preserved
-        assert_eq!(result["log"]["level"], "info");
-    }
-
-    #[test]
-    fn overlay_object_overwrites_base_scalar() {
-        let result = merge(r#"{"log": "info"}"#, r#"{"log": {"level": "debug"}}"#);
-        assert_eq!(result["log"]["level"], "debug");
-    }
-
-    #[test]
-    fn overlay_scalar_overwrites_base_object() {
-        let result = merge(
-            r#"{"experimental": {"clash_api": {"port": 9090}}}"#,
-            r#"{"experimental": "disabled"}"#,
-        );
-        assert_eq!(result["experimental"], "disabled");
-    }
-
-    #[test]
-    fn empty_overlay_is_noop() {
-        let result = merge(r#"{"port": 7890, "tun": {"stack": "system"}}"#, r#"{}"#);
-        assert_eq!(result["port"], 7890);
-        assert_eq!(result["tun"]["stack"], "system");
-    }
-
-    #[test]
-    fn deep_nested_merge() {
-        let result = merge(
-            r#"{"a": {"b": {"c": 1, "d": 2}}}"#,
-            r#"{"a": {"b": {"c": 10, "e": 3}}}"#,
-        );
-        assert_eq!(result["a"]["b"]["c"], 10); // overwritten
-        assert_eq!(result["a"]["b"]["d"], 2); // preserved
-        assert_eq!(result["a"]["b"]["e"], 3); // added
-    }
-
-    #[test]
-    fn array_in_nested_object_is_replaced() {
-        let result = merge(
-            r#"{"a": {"b": [1, 2, 3], "c": "keep"}}"#,
-            r#"{"a": {"b": [4, 5]}}"#,
-        );
-        let b = result["a"]["b"].as_array().unwrap();
-        assert_eq!(b.len(), 2);
-        assert_eq!(b[0], 4);
-        assert_eq!(b[1], 5);
-        assert_eq!(result["a"]["c"], "keep");
-    }
-
-    #[test]
-    fn base_empty_with_overlay() {
-        let result = merge(
-            r#"{}"#,
-            r#"{"inbounds": [{"type": "mixed", "port": 20122}], "log": {"level": "info"}}"#,
-        );
-        assert_eq!(result["inbounds"].as_array().unwrap().len(), 1);
-        assert_eq!(result["log"]["level"], "info");
     }
 
     // ── Tests for standalone proxy-provider URL extraction during update ──────

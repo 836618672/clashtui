@@ -4,14 +4,11 @@ pub mod defs {
     pub const CONFIG_FILE: &str = "config.yaml";
     pub const DATA_FILE: &str = "clashtui.db";
     pub const CORE_OVERRIDE_FILE: &str = "core_override_config.yaml";
-    pub const CORE_OVERRIDE_SINGBOX_FILE: &str = "core_override_config.json";
     #[cfg(feature = "customized-theme")]
     pub const THEME_FILE: &str = "theme.yaml";
     pub const PROFILE_YAMLS_DIR: &str = "profiles";
-    pub const PROFILE_JSONS_DIR: &str = "profiles";
     pub const TEMPLATE_DIR: &str = "templates";
     pub const KEYMAP_FILE: &str = "keymap.yaml";
-    pub const PROXY_PROVIDERS_DIR: &str = "proxy-providers";
 }
 
 pub(super) fn load_home_dir() -> Result<std::path::PathBuf> {
@@ -46,9 +43,8 @@ macro_rules! load_save {
         impl $id {
             pub fn to_file(&self) -> Result<()> {
                 let path = DATA_DIR.get().unwrap().join($name);
-                let fp = std::fs::File::create(&path)
-                    .with_context(|| format!("Failed to create {}", path.display()))?;
-                serde_yml::to_writer(fp, &self)
+                let bytes = serde_yml::to_string(self)?;
+                crate::functions::file::activation::atomic_write(&path, bytes.as_bytes())
                     .with_context(|| format!("Failed to write {}", path.display()))
             }
         }
