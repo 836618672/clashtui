@@ -12,7 +12,7 @@
 node scripts/test-pipeline.mjs
 ```
 
-脚本依次执行格式检查、严格 Clippy、全部特性 Rust 测试、无默认特性 Rust 测试、TUI 构建、Web DOM 测试、CLI 模拟核心流程和 TUI 伪终端测试。失败后继续收集其他阶段结果，最终以非零状态退出。每阶段最多 20 分钟；Unix 中超时或取消会终止该阶段的进程组。
+脚本先执行 npm ci、Vue 类型检查/构建、Vitest 和构建产物一致性校验，再执行格式检查、严格 Clippy、全部特性 Rust 测试、无默认特性 Rust 测试、TUI 构建、CLI 模拟核心流程和 TUI 伪终端测试。失败后继续收集其他阶段结果，最终以非零状态退出。每阶段最多 20 分钟；Unix 中超时或取消会终止该阶段的进程组。
 
 结果保存在 `target/test-results/<运行编号>/`：`report.json`、`report.md` 和每阶段日志。可通过 `CLASHTUI_REPORT_DIR` 指定目录。报告分别列出 passed、failed、skipped；未执行项目不计为通过。`CARGO_TARGET_DIR` 会通过 Cargo metadata 解析，进程用例使用本次构建的二进制。
 
@@ -26,11 +26,25 @@ cd ../..
 node scripts/test-pipeline.mjs --browser
 ```
 
-也可用 `CLASHTUI_CHROMIUM_PATH` 指定已有 Chromium。单独执行 `npm test --prefix tests/browser` 时，先运行 `cargo build --locked --all-features`；自定义目标目录时显式设置 `CLASHTUI_TEST_BINARY`。浏览器仅访问临时管理页、临时面板静态服务器和回环模拟核心，阻断页面向外部地址发出的请求。失败保留 trace、截图和 HTML 报告。
+也可用 `CLASHTUI_CHROMIUM_PATH` 指定已有 Chromium。单独执行 `npm test --prefix tests/browser` 时，先运行 `cargo build --locked --all-features`；自定义目标目录时显式设置 `CLASHTUI_TEST_BINARY`。浏览器仅访问临时 Vue 面板；只有 Rust 服务连接回环模拟核心，阻断页面向外部地址发出的请求。失败保留 trace、截图和 HTML 报告。
 
-设置 `CLASHTUI_METACUBEXD_ARCHIVE=/path/to/compressed-dist.tgz` 后，浏览器还会校验 v1.273.1 发布包 SHA-256，并在临时目录解包，测试真实面板恢复自动选组及 CLI 回读。没有提供归档时，该用例明确跳过；CI 下载固定发布资产后执行。它不部署面板到当前核心，也不证明所有上游页面或真实核心行为。
+面板已经内置；不再需要 MetaCubeXD 发布归档，不下载上游面板。浏览器用例验证统一认证、节点选择与恢复自动选择、节点/组/Provider 测速、资源与规则能力、连接筛选/详情/导出/固定集合关闭、设置/持久化/DNS、维护成功与失败、实时流重连和日志有界缓存。它们使用模拟核心，真实 VM 结果另列。
 
 ## 自动覆盖范围
+
+### 单元测试的单独运行
+
+已有依赖时，可从项目根目录运行：
+
+```sh
+npm --prefix web test
+npm --prefix web run typecheck
+cargo test --all-features
+```
+
+前端的 `web/src/store.test.ts` 使用可控 Promise 和虚拟时钟验证任务等待、失败、替换、取消、重复提交、跨会话迟到响应，以及日志/采样缓存上限与重置；`live.test.ts` 驱动 Vue 生命周期钩子，验证暂停、恢复、卸载、错误去重和过期请求；`settings-patch.test.ts` 验证字段白名单、嵌套编辑和零值。它们不依赖真实核心或浏览器。Rust 管理模块测试使用自动清理的临时文件，验证非法编辑保留原文、新文件修订校验、连续保存冲突及运行设置持久化边界。
+
+2026-10-04 本轮新增 27 项单测（前端 22、Rust 5）。前端共 35 项通过；全部特性 Rust 共 365 项单测和 7 项进程测试通过，1 项人工交互测试保持忽略。新增回归先复现、再修复了旧操作失败、旧轮询错误和旧登录请求干扰新会话状态的三处竞态。另有 5 项登录/通知浏览器回归及严格 Clippy 通过；本轮未运行完整 VM 流水线。已有测试流水线会自动发现这些测试，无需新增依赖。
 
 | 功能 | 自动验证 | 边界 |
 |---|---|---|
@@ -67,7 +81,7 @@ node scripts/test-pipeline.mjs --browser
 
 - 全特性 Rust：354 项单元/模拟测试与 7 项进程测试通过，1 项手工交互测试忽略。
 - CLI 特性 Rust：146 项单元测试与 7 项进程测试通过，1 项手工交互测试忽略；这部分与全特性覆盖有重叠。
-- Web DOM：6 项通过；CLI 核心流程：5 项通过，新增慢测速响应与 URL 编码往返；TUI PTY：3 项通过，包含模拟核心/服务操作、模板命名、取消覆盖及非法 YAML 诊断。
+- Vue 单元：6 项通过；CLI 核心流程：5 项通过，新增慢测速响应与 URL 编码往返；TUI PTY：3 项通过，包含模拟核心/服务操作、模板命名、取消覆盖及非法 YAML 诊断。
 - Chromium：5 项管理页及 1 项锁定 MetaCubeXD 页面测试通过，新增非法 YAML 的 Web/CLI 诊断对照；本地使用已有 Nix Chromium，CI 使用 Playwright 对应 Chromium。
 - Bash 安装脚本：另行执行 22 项隔离单元测试通过，只测试参数和临时文件，不进行实际安装。
 
@@ -77,7 +91,7 @@ node scripts/test-pipeline.mjs --browser
 
 本机 Linux 虚拟机已建立，启动、访问、快照与恢复见[本地虚拟机环境](local_vm_testing_zh.md)。其真实核心冒烟证据独立保存，不改变默认 mock 流水线的实机阶段 skipped 状态。
 
-真实服务安装/卸载与自启、Windows 系统代理、TUN/路由/DNS、真实核心加载和恢复、锁定 MetaCubeXD 面板、真实订阅网络错误与更新、核心/Geo 升级无法由 mock 证明。默认报告将这一层明确标记为 skipped，不自动执行安装脚本。
+真实服务安装/卸载与自启、Windows 系统代理、TUN/路由/DNS、真实核心加载和恢复、内置 Vue 面板、真实订阅网络错误与更新、核心/Geo 升级无法由 mock 证明。默认报告将这一层明确标记为 skipped，不自动执行安装脚本。
 
 建立带快照的 Linux/macOS/Windows 测试机；使用 NAT，禁止桥接和宿主配置目录共享。每项从快照恢复，用独立账号、核心配置及测试令牌。按[自动闭环方案](README.md)分配真实自动断言和专项。M01–M30 只作覆盖/复现参考，不要求全部手工操作。记录核心版本、操作前后服务状态、配置文件、网络接口、路由、DNS、截图和日志。至少包含：
 

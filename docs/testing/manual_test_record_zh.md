@@ -9,7 +9,7 @@
 | 日期、操作者、报告编号 | |
 | 提交、dirty 状态、二进制 SHA-256 | |
 | mini PC / 客机系统，Mihomo 版本 | |
-| MetaCubeXD 版本、资产摘要 | |
+| 内置 Vue 面板、二进制摘要 | |
 | A 隔离流水线报告路径与 passed/failed/skipped | |
 | B 真实 VM 报告路径与 passed/failed/skipped/未执行 | |
 | C 必需 ID 的通过/失败/缺失情况 | |
@@ -75,7 +75,7 @@ H06 的复制与 Safari 子项分别给状态；一个子项通过不代表整�
 {
   "binary_sha256": "填写实际摘要",
   "core_version": "1.19.24",
-  "panel_version": "v1.273.1",
+  "dashboard": "builtin-vue",
   "browser": "填写 Mac 系统与浏览器版本/范围",
   "terminal": "填写终端版本、TERM、尺寸",
   "checks": {

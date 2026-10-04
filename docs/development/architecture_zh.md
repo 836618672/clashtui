@@ -4,6 +4,21 @@
 
 > 本文侧重于当前代码架构。功能范围见[功能设计](clashtui_feature_design_zh.md)，验证状态见[项目状态](../reference/project_status_zh.md)。
 
+## 仓库导航
+
+| 路径 | 职责 |
+|---|---|
+| `src/` | Rust 共享业务层、CLI、TUI、HTTP 服务 |
+| `web/src/` | Vue 页面、组件、会话状态及邻近单元测试 |
+| `web/dist/` | 嵌入二进制的页面与构建摘要，随源码一起提交 |
+| `tests/` | Rust 集成、隔离接口、PTY 和浏览器回归；Mihomo 测试样本 |
+| `scripts/` | 构建检查、自动验收与隔离 VM 操作入口 |
+| `contrib/`、`installs/` | 默认配置、服务定义与安装器 |
+| `docs/` | 使用、开发、参考、测试；旧审查集中在 `archive/README.md` |
+| `target/` | 本地编译、测试报告与 VM 数据，不提交 |
+
+Web 构建和接口边界见 [Vue 管理面板](web_dashboard_zh.md)；测试执行见[测试入口](../testing/README.md)。前端改动先重建 `web/dist/`，再编译 Rust。
+
 ## 技术栈
 
 - 语言：Rust（Edition 2024）

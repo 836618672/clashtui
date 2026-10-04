@@ -73,7 +73,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/hea
 
 ```sh
 sudo systemctl enable clashtui_mihomo.service
-# OR
 ```
 
 #### macOS
@@ -92,7 +91,6 @@ brew install mihomo # 目前 clashtui 还没有上传, 请手动安装 clashtui
 
 ```sh
 sudo launchctl load -w /Library/LaunchDaemons/clashtui_mihomo.plist
-# 或
 ```
 
 #### Windows
@@ -121,7 +119,7 @@ iex "& {$(irm https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/m
 3. 启动 clashtui 安装 clashtui_mihomo 服务
 
 安装脚本不注册 Windows Service。启动 clashtui 后，使用 CoreSrvCtl 安装并启动 core 服务。
-将其中一个服务设置为开机启动即可 (不要两个同时开机启动)
+按需将 Mihomo 服务设置为开机启动。
 
 ### 没有 root 权限 (不开启 tun)
 
@@ -135,7 +133,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/hea
 
 ```sh
 systemctl --user enable clashtui_mihomo.service
-# 或
 ```
 
 #### macOS
@@ -148,13 +145,16 @@ bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/hea
 
 ```sh
 launchctl load -w ~/Library/LaunchAgents/clashtui_mihomo.plist
-# 或
 ```
 
 ## FAQ
 
 - 文件权限之类的问题: 因为 clashtui 需要用到组权限, 所以请重新登录使组权限生效。
 - connection refused 的问题: 比如: mihomo, 请使用 `netstat -utapln | grep 9090` 检查 clash api 端口有没有打开。
+
+## 内置 Web 面板
+
+Vue 3 + TypeScript + Vite 面板统一管理核心与本地配置、订阅、模板和服务。构建与认证见 [Web 面板文档](docs/development/web_dashboard_zh.md)，源代码、测试与脚本位置见[仓库导航](docs/development/architecture_zh.md#仓库导航)。
 
 ## 文档
 

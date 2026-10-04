@@ -112,7 +112,9 @@ pub fn activate(
             )),
         };
         return match recovery {
-            Ok(()) => Err(error.context("Activation failed; previous file restored")),
+            Ok(()) => Err(anyhow::anyhow!(
+                "Activation failed; previous file restored: {error:#}"
+            )),
             Err(recovery) => Err(anyhow::anyhow!(
                 "Activation failed: {error:#}; recovery failed: {recovery:#}. Check the running core before retrying"
             )),
@@ -194,6 +196,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("restored"));
+        assert!(error.to_string().contains("reload failed"));
         assert_eq!(calls, 2);
         assert_eq!(std::fs::read(&path).unwrap(), b"old");
         std::fs::remove_dir_all(dir).unwrap();

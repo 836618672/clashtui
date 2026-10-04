@@ -1,5 +1,12 @@
 # Changelog
 
+## 内置 Vue 管理面板（2026-10-03）
+
+- 用 Vue 3、TypeScript、Vite 统一核心面板与本地管理，随 Rust 二进制离线提供。
+- 新增核心读写网关及四路实时流缓存；单一管理令牌、日志脱敏、有界采样、固定连接集合关闭和任务恢复。
+- 不再下载 MetaCubeXD；旧 panel/prepare_panel 命令改为检查内置资源，默认配置移除 external-ui 下载地址。
+- 更新浏览器/VM 自动测试与 Mac 人工步骤；历史 UDP 未通过结论保留。
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
@@ -9,17 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Shared management workflows for CLI, TUI and the local Web interface, including transactional document saves, subscription updates, template generation and service operations.
-- A local management Web interface alongside the pinned MetaCubeXD v1.273.1 panel, with separate authentication and persistent job results.
+- An embedded Vue 3 management dashboard replacing the MetaCubeXD runtime, with separate authentication and persistent job results.
 - Automated mock, browser, PTY and real Mihomo VM acceptance tests, plus public subscription, installation lifecycle, maintenance and bounded soak suites.
 
 ### Removed
 - sing-box support, core switching, JSON templates, bundled resources and installer downloads. CLI, TUI and Web now manage Mihomo only.
 
 ### Changed
+- Use themed in-app confirmation/input dialogs with mobile layout, keyboard focus containment and explicit destructive actions.
+- Consolidate historical review documents and frontend store tests; remove obsolete sing-box fixtures and development skills.
 - Legacy databases retain Mihomo profiles and preserve the original content in `clashtui.db.before-mihomo-only` before discarded legacy data can be rewritten.
 - Reorganize documentation into guides, development, reference, testing and historical archives, with current progress and test evidence linked from `docs/README.md`.
+- Redesign the local management page with navigation, live overview cards, responsive configuration lists and dedicated document/result sections; clarify management token and panel secret usage.
 
 ### Fixed
+- Persist validated Web sessions across reloads; keep notifications visible, chart legends clear, and stale async results out of newer sessions.
+- Explain subscription validation/timeouts, allow direct or proxy downloads, and normalize Mihomo IPv6/GeoIP activation readback.
 - Provider path validation, text/MRS rule handling, subscription failure reporting, empty group fallback and read-only database revision changes.
 - TUI editor recovery, filtered node selection and Web polling conflicts with foreground edits and operations.
 - Installer cancellation status, service shutdown and autostart cleanup during uninstall, file linking and privileged configuration copies.

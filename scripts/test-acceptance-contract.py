@@ -8,7 +8,7 @@ class Decisions(unittest.TestCase):
     def setUp(self):
         self.stages = [{'name': 'vm', 'status': 'passed'}, {'name': 'restore-check', 'status': 'passed'}]
         self.reports = {'isolated': {'failed': 0}, 'vm': {'failed': 0, 'cases': [{'id': i, 'status': 'passed'} for i in sorted(REQUIRED_C)]}}
-        self.record = {'binary_sha256': 'same-build', 'core_version': '1.19.24', 'panel_version': 'v1.273.1',
+        self.record = {'binary_sha256': 'same-build', 'core_version': '1.19.24', 'dashboard': 'builtin-vue',
                        'browser': 'Chrome / macOS', 'terminal': 'Terminal / xterm',
                        'checks': {f'H{i:02}': {'status': 'passed', 'evidence': 'actual observation'} for i in range(1, 7)}}
     def decision(self):

@@ -74,29 +74,24 @@ def digest_directory(path):
 
 
 def panel_network_install():
+    before = cli('manage', 'state')['dashboard']
     cli('manage', 'prepare_panel', '--yes')
-    record = json.loads((CORE / 'uis/metacubexd/clashtui-panel.json').read_text())
-    assert record['version'] == 'v1.273.1'
-    assert record['sha256'] == 'a178e00b67acabcda2dcef00afa90be6a7bb261e466a67dad58c8478d9553603'
-    assert (CORE / 'uis/metacubexd/index.html').is_file()
-    return {'actual_remote_archive': True, 'pinned_version': record['version'],
-            'archive_hash_verified': True, 'installed_record_verified': True}
+    after = cli('manage', 'state')['dashboard']
+    assert before == after and after['builtin'] is True
+    return {'builtin_dashboard': True, 'no_remote_archive_needed': True, 'sha256': after['sha256']}
 
 
 def panel_failed_download():
-    directory = CORE / 'uis/metacubexd'
-    before = digest_directory(directory)
+    # The replacement works even with guest DNS pointed away from GitHub.
+    before = cli('manage', 'state')['dashboard']
     hosts = Path('/etc/hosts').read_bytes()
     try:
-        subprocess.run(['sudo', 'tee', '/etc/hosts'], input=hosts + b'\n127.0.0.1 github.com\n',
-                       stdout=subprocess.DEVNULL, check=True)
-        cli('manage', 'prepare_panel', '--yes', success=False)
-        assert digest_directory(directory) == before
-        assert not list(directory.parent.glob('.metacubexd-staging-*'))
+        subprocess.run(['sudo', 'tee', '/etc/hosts'], input=hosts + b'\n127.0.0.1 github.com\n', stdout=subprocess.DEVNULL, check=True)
+        cli('manage', 'prepare_panel', '--yes')
+        assert cli('manage', 'state')['dashboard'] == before
     finally:
         subprocess.run(['sudo', 'tee', '/etc/hosts'], input=hosts, stdout=subprocess.DEVNULL, check=True)
-    return {'real_download_failure_nonzero': True, 'panel_bytes_preserved': True,
-            'no_staging_left': True, 'guest_hosts_restored': True}
+    return {'github_unavailable_dashboard_unchanged': True, 'guest_hosts_restored': True}
 
 
 def geo_network_update():

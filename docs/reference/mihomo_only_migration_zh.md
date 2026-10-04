@@ -1,6 +1,6 @@
 # Mihomo 单核心迁移
 
-项目现在仅管理 Mihomo（Clash.Meta）。CLI、TUI、本地管理 Web 和固定版本 MetaCubeXD 面板围绕同一 Mihomo 后端工作。
+项目现在仅管理 Mihomo（Clash.Meta）。CLI、TUI、内置 Vue 管理 Web围绕同一 Mihomo 后端工作。
 
 ## 接口变化
 

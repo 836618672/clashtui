@@ -4,6 +4,21 @@ This document describes the code architecture of Clashtui for developers to unde
 
 > This is an overview of the current code. See [feature design](clashtui_feature_design_en.md) and [project status (Chinese)](../reference/project_status_zh.md) for scope and verification.
 
+## Repository map
+
+| Path | Responsibility |
+|---|---|
+| `src/` | Shared Rust workflows, CLI, TUI and HTTP server |
+| `web/src/` | Vue pages, components, session state and colocated unit tests |
+| `web/dist/` | Embedded page and build manifest, committed with sources |
+| `tests/` | Integration, isolated API, PTY and browser tests; Mihomo fixtures |
+| `scripts/` | Build checks, acceptance runner and isolated VM operations |
+| `contrib/`, `installs/` | Default configurations, service definitions and installers |
+| `docs/` | Guides, development, reference and testing; historical reviews in `archive/README.md` |
+| `target/` | Local build outputs, reports and VM data; not committed |
+
+See the [Vue dashboard guide (Chinese)](web_dashboard_zh.md) for frontend builds and API boundaries, and the [test entry point (Chinese)](../testing/README.md). Rebuild `web/dist/` before compiling Rust after frontend changes.
+
 ## Tech Stack
 
 - Language: Rust (Edition 2024)

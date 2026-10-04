@@ -4,7 +4,6 @@ set -euo pipefail
 [[ $(hostname) == clashtui-test ]] || { echo 'This script is only for the clashtui-test guest' >&2; exit 1; }
 [[ $(id -un) == tester ]] || { echo 'Run as tester inside the guest' >&2; exit 1; }
 test -x /opt/clashtui/bin/mihomo
-test -d /opt/clashtui/panel
 test ! -f /home/tester/clashtui-test/config/config.yaml || { echo 'Guest is already configured; use a snapshot to reset' >&2; exit 1; }
 python3 - <<'PY'
 import json, secrets, shutil
@@ -14,10 +13,9 @@ core = root / 'mihomo'
 for path in [core / 'profiles', core / 'templates']:
     path.mkdir(parents=True, exist_ok=True)
 root.chmod(0o700)
-shutil.copytree('/opt/clashtui/panel', core / 'uis/metacubexd')
 secret = secrets.token_urlsafe(32)
 overlay = {'mixed-port':7890, 'external-controller':'127.0.0.1:9090', 'secret':secret,
-    'external-ui':'uis/metacubexd', 'allow-lan':False, 'ipv6':False, 'mode':'rule',
+    'allow-lan':False, 'ipv6':False, 'mode':'rule',
     'log-level':'info', 'tun':{'enable':False}, 'dns':{'enable':False}, 'geo-auto-update':False}
 (core / 'core_override_config.yaml').write_text(json.dumps(overlay))
 (core / 'config.yaml').write_text(json.dumps({**overlay, 'proxies':[],

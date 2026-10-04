@@ -6,17 +6,24 @@ import os
 from pathlib import Path
 import re
 import shutil
+import shlex
 import socket
 import subprocess
 import tarfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
-VM = ROOT / "target/vm"
+VM = Path(os.environ.get("CLASHTUI_VM_DIR", ROOT / "target/vm")).resolve()
+if not VM.is_relative_to(ROOT / "target"):
+    raise RuntimeError("VM directory must stay inside the project target directory")
 BASE = VM / "debian-12-genericcloud-amd64.qcow2"
 DISK = VM / "guest.qcow2"
 IMAGE_URL = "https://cloud.debian.org/images/cloud/bookworm/latest/"
-SSH_PORT, CORE_PORT, WEB_PORT = 22222, 29090, 29091
+SSH_PORT = int(os.environ.get("CLASHTUI_VM_SSH_PORT",22222))
+CORE_PORT = int(os.environ.get("CLASHTUI_VM_CORE_PORT",29090))
+WEB_PORT = int(os.environ.get("CLASHTUI_VM_WEB_PORT",29091))
+if len({SSH_PORT,CORE_PORT,WEB_PORT}) != 3 or not all(1024 <= p <= 65535 for p in [SSH_PORT,CORE_PORT,WEB_PORT]):
+    raise RuntimeError("VM ports must be distinct unprivileged ports")
 
 
 def run(args, **kwargs):
@@ -180,11 +187,6 @@ def push(mihomo=None, panel=None):
         (bundle / "mihomo").unlink(missing_ok=True)
         shutil.copy2(mihomo, bundle / "mihomo")
         libs += subprocess.check_output(["ldd", str(mihomo)], text=True)
-    if panel:
-        expected = "a178e00b67acabcda2dcef00afa90be6a7bb261e466a67dad58c8478d9553603"
-        with panel.open("rb") as file:
-            if hashlib.file_digest(file, "sha256").hexdigest() != expected:
-                raise RuntimeError("MetaCubeXD v1.273.1 archive checksum mismatch")
     stores = sorted(set(re.findall(r"/nix/store/[^/\s]+", libs)))
     archive = VM / "runtime.tar.gz"
     # Nix splits runtime outputs; copy symlink targets rather than dangling links.
@@ -193,15 +195,11 @@ def push(mihomo=None, panel=None):
         tar.add(ROOT / "scripts/vm-guest-setup.sh", arcname="opt/clashtui/setup.sh")
         if mihomo:
             tar.add(bundle / "mihomo", arcname="opt/clashtui/bin/mihomo")
-        if panel:
-            tar.add(panel, arcname="opt/clashtui/panel.tgz")
         for store in stores:
             tar.add(store, arcname=store.lstrip("/"))
     with archive.open("rb") as content:
         run(ssh_args() + ["sudo tar xzf - -C / && sudo ln -sf /opt/clashtui/bin/clashtui /usr/local/bin/clashtui"], stdin=content)
     run(ssh_args() + ["clashtui --version"])
-    if panel:
-        run(ssh_args() + ["sudo mkdir -p /opt/clashtui/panel && sudo tar xzf /opt/clashtui/panel.tgz -C /opt/clashtui/panel"])
     print("Copied the build and its Nix runtime into the guest; no host directory is shared")
 
 
@@ -218,12 +216,12 @@ def tunnel():
         "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
         "-L", f"127.0.0.1:{CORE_PORT}:127.0.0.1:9090",
         "-L", f"127.0.0.1:{WEB_PORT}:127.0.0.1:9091"])
-    print(f"Core/panel: http://127.0.0.1:{CORE_PORT}/ui/; management: http://127.0.0.1:{WEB_PORT}/")
+    print(f"Core API: http://127.0.0.1:{CORE_PORT}/; dashboard: http://127.0.0.1:{WEB_PORT}/")
 
 
-def check():
+def check(allow_internet=False, profile="baseline"):
     with (ROOT / "scripts/vm-guest-smoke.py").open("rb") as script:
-        result = run(ssh_args() + ["python3 -"], stdin=script, capture_output=True)
+        result = run(ssh_args() + ["python3 -" + (" --allow-internet" if allow_internet else "") + " --profile " + shlex.quote(profile)], stdin=script, capture_output=True)
     report = json.loads(result.stdout)
     disk = json.loads(subprocess.check_output(["qemu-img", "info", "-U", "--output=json", str(DISK)], text=True))
     report["disk_backing"] = disk.get("full-backing-filename")
@@ -260,8 +258,11 @@ def main():
     shell.add_argument("args", nargs=argparse.REMAINDER)
     upload = sub.add_parser("push")
     upload.add_argument("--mihomo", type=Path, help="Copy this Mihomo binary into the guest")
-    upload.add_argument("--panel", type=Path, help="Verified MetaCubeXD v1.273.1 archive")
-    for name in ["status", "stop", "tunnel", "check", "checkpoint", "reset"]:
+    upload.add_argument("--panel", type=Path, help="Deprecated compatibility argument; dashboard is built in")
+    verify = sub.add_parser("check")
+    verify.add_argument("--allow-internet", action="store_true", help="Check manual subscription testing without requiring blocked outbound traffic")
+    verify.add_argument("--profile", default="baseline", help="Expected active profile during manual testing")
+    for name in ["status", "stop", "tunnel", "checkpoint", "reset"]:
         sub.add_parser(name)
     args = parser.parse_args()
     if args.command == "prepare":
@@ -277,7 +278,7 @@ def main():
     elif args.command == "tunnel":
         tunnel()
     elif args.command == "check":
-        check()
+        check(args.allow_internet, args.profile)
     elif args.command == "stop":
         stop()
     elif args.command == "status":

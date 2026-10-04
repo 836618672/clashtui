@@ -8,11 +8,15 @@ newtype_tab!(StatusTab(Tab<Status>));
 mod_agent!(
     Key,
     [
-        ([KeyCode::Char('w')], Key::OpenPanel, "Open MetaCubeXD"),
+        (
+            [KeyCode::Char('w')],
+            Key::OpenPanel,
+            "Open ClashTui dashboard"
+        ),
         (
             [KeyCode::Char('i')],
             Key::PreparePanel,
-            "Prepare pinned MetaCubeXD panel"
+            "Verify bundled dashboard"
         ),
     ]
 );
@@ -246,8 +250,8 @@ impl TabContent for Status {
             }
             Key::PreparePanel => {
                 async {
-                    if crate::tui::widget::popmsg::Confirm::title("Prepare MetaCubeXD v1.273.1?".to_owned())
-                        .with_prompt("Download the locked release, verify SHA-256, then replace the panel directory. Enter confirms; Esc cancels.".to_owned())
+                    if crate::tui::widget::popmsg::Confirm::title("Verify bundled dashboard?".to_owned())
+                        .with_prompt("Verify the embedded Vue dashboard. No download is needed. Enter confirms; Esc cancels.".to_owned())
                         .build_and_send().await.is_err() { return do_nothing(); }
                     if let Err(error) = crate::functions::restful::session::spawn_blocking(crate::functions::file::panel::prepare).await.unwrap() { crate::tui::widget::popmsg::Confirm::err(error); }
                     do_nothing()
@@ -263,18 +267,13 @@ impl TabContent for Status {
         let mut lines: Vec<String> = vec![];
         let configured = CONFIG.core_type();
         lines.push(format!(
-            "MetaCubeXD target {} · {}/ui/ · w opens · i prepares",
+            "ClashTui dashboard {} · {} · w opens · i verifies",
             crate::functions::file::panel::VERSION,
-            CONFIG.controller_for_core().trim_end_matches('/')
+            crate::functions::file::panel::url()
         ));
-        let panel = crate::functions::file::panel::deployment_state();
-        lines.push(if panel["verified_install_record"] == true {
-            "Panel: pinned installation recorded (served assets require browser verification)"
-                .to_owned()
-        } else {
-            "Panel: installation version unknown; prepare the pinned release to record it"
-                .to_owned()
-        });
+        lines.push(
+            "Dashboard is bundled; start with clashtui web and use the management token".to_owned(),
+        );
         if let Some(detected) = self.detected_core_type {
             if detected == configured {
                 lines.push(format!("core: {detected}"));

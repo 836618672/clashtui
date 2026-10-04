@@ -267,7 +267,9 @@ def migration():
             socket.create_connection(('127.0.0.1', 9090), timeout=.3).close(); raise AssertionError('Old controller still accepts connections')
         except OSError: pass
         subprocess.run(['sudo', 'systemctl', 'restart', 'clashtui-test-web'], check=True); wait_web()
-        assert ':19090/' in request('/api/state')['panel']
+        assert request('/api/state')['dashboard']['builtin'] is True
+        core_view = request('/api/core/read', {'view':'status'})
+        assert core_view['version']['meta'] and new_secret not in json.dumps(core_view)
         runtime = action('runtime'); assert runtime['ok'], runtime
         return {'online_refused': True, 'new_session_readback': True, 'old_secret_rejected': True, 'old_address_closed': True, 'web_restarted': True}
     finally:

@@ -73,7 +73,6 @@ Tip: The install script downloads resources from GitHub. If downloads keep faili
 
 ```sh
 sudo systemctl enable clashtui_mihomo.service
-# OR
 ```
 
 #### macOS
@@ -94,7 +93,6 @@ bash <(curl -fsSL https://raw.githubusercontent.com/JohanChane/clashtui/refs/hea
 
 ```sh
 sudo launchctl load -w /Library/LaunchDaemons/clashtui_mihomo.plist
-# OR
 ```
 
 #### Windows
@@ -124,7 +122,7 @@ iex "& {$(irm https://raw.githubusercontent.com/JohanChane/clashtui/refs/heads/m
 
 3. Start clashtui, then use CoreSrvCtl to install and start core services:
 
-The install script does NOT register Windows Services. Launch clashtui and use the built-in CoreSrvCtl to manage services. Enable only one core service at boot (do not enable both simultaneously).
+The install script does NOT register Windows Services. Launch clashtui and use the built-in CoreSrvCtl to manage services. Enable the Mihomo service at boot if needed.
 
 ### Without root access (no TUN)
 
@@ -138,7 +136,6 @@ Enable on boot:
 
 ```sh
 systemctl --user enable clashtui_mihomo.service
-# OR
 ```
 
 #### macOS
@@ -151,13 +148,16 @@ Enable on boot:
 
 ```sh
 launchctl load -w ~/Library/LaunchAgents/clashtui_mihomo.plist
-# OR
 ```
 
 ## FAQ
 
 -   File permission issues: Since clashtui requires group permissions, please log in again for the group permissions to take effect.
 -   Connection refused issues (e.g., with mihomo): Please use `netstat -utapln | grep 9090` to check whether the Clash API port is open.
+
+## Built-in Web dashboard
+
+Vue 3 + TypeScript + Vite provides core and local management in one embedded page. See the [dashboard build guide (Chinese)](docs/development/web_dashboard_zh.md) and [repository map](docs/development/architecture_en.md#repository-map).
 
 ## Documentation
 

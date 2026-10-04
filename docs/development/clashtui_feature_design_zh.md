@@ -48,7 +48,7 @@ Linux 支持 systemd/OpenRC，macOS 使用 launchd，Windows 使用 NSSM；Windo
 
 TUI 提供 Status、Files、Proxies、Connections、Logs、Settings、Service、Rules、Providers 九个标签。自定义快捷键和主题可以保留 `mihomo` 覆盖段。
 
-Web 当前由锁定版本 MetaCubeXD 核心面板与本地管理页组成。原版面板显示核心数据；管理页管理本地订阅、模板、覆盖配置和服务。MetaCubeXD 源码整合尚未实施。
+Web 已替换为内置 Vue 3 + TypeScript + Vite 面板，统一管理核心、订阅、模板、覆盖配置和服务；实现与构建见[Vue 面板](web_dashboard_zh.md)。
 
 详细入口见[三端功能矩阵](../reference/cli_tui_web_parity_zh.md)，架构见[架构说明](architecture_zh.md)。
 

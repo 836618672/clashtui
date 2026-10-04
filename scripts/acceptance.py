@@ -15,7 +15,7 @@ import time
 from acceptance_contract import REQUIRED_C, automatic_result, manual_result
 ROOT=Path(__file__).resolve().parent.parent
 parser=argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--panel-archive',type=Path,default=Path('/tmp/clashtui-metacubexd-dist.tgz'))
+parser.add_argument('--panel-archive',type=Path,help='Deprecated compatibility argument; Vue dashboard is bundled')
 parser.add_argument('--manual-record',type=Path,help='JSON H01-H06 records for the same binary/environment')
 parser.add_argument('--soak-seconds',type=int,default=120)
 args=parser.parse_args()
@@ -27,7 +27,7 @@ lock=(ROOT/'target/acceptance.lock').open('w')
 try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
 except BlockingIOError:raise SystemExit('Another acceptance run is active')
 os.environ.update(CARGO_TARGET_DIR=str(ROOT/'target'),CLASHTUI_REPORT_DIR=str(run/'isolated'),
-    CLASHTUI_VM_REPORT_DIR=str(run.relative_to(ROOT)/'vm'),CLASHTUI_METACUBEXD_ARCHIVE=str(args.panel_archive.resolve()),
+    CLASHTUI_VM_REPORT_DIR=str(run.relative_to(ROOT)/'vm'),
     CLASHTUI_CHROMIUM_PATH=shutil.which('chromium') or '',CLASHTUI_SOAK_SECONDS=str(args.soak_seconds))
 stages=[];interrupted=False;active=None;vm_touched=False
 
@@ -83,8 +83,7 @@ try:
     (run/'source-manifest.json').write_text(json.dumps(source_manifest(),sort_keys=True,indent=2)+'\n')
     (run/'source-status.txt').write_text(subprocess.check_output(['git','status','--short'],text=True))
     (run/'commit.txt').write_text(subprocess.check_output(['git','rev-parse','HEAD'],text=True))
-    if not args.panel_archive.is_file():raise RuntimeError('Pinned panel archive missing; panel tests cannot be silently skipped')
-    assert hashlib.sha256(args.panel_archive.read_bytes()).hexdigest()=='a178e00b67acabcda2dcef00afa90be6a7bb261e466a67dad58c8478d9553603'
+    stage('frontend-consistency',['node','web/scripts/build-manifest.mjs','--check'])
     stage('guest-before',vm('check'),60)
     # Preserve the pre-reset test environment evidence without reading host profiles.
     stage('guest-evidence-before',vm('ssh','tar --ignore-failed-read -czf - -C /home/tester/clashtui-test acceptance acceptance-c acceptance-c-tui manual'),60,binary_output=True)
@@ -142,7 +141,7 @@ finally:
             manual=json.loads(args.manual_record.read_text())
             manual_valid=manual_result(manual,(run/'binary-sha256.txt').read_text().strip())
         except (OSError,ValueError):pass
-    report={'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'scope':'Linux Debian 12 / Mihomo 1.19.24 / pinned MetaCubeXD / controlled guest networking',
+    report={'created_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'scope':'Linux Debian 12 / Mihomo 1.19.24 / bundled Vue dashboard / controlled guest networking',
         'stages':stages,'reports':checks,'required_c_cases':sorted(expected),'missing_c_cases':missing,'failed_c_cases':failed_cases,'duplicate_c_ids':decision['duplicate_ids'],
         'automatic_passed':automatic,'manual_valid_for_binary':manual_valid,'accepted_current_scope':automatic and manual_valid,
         'accepted':False, # This entry has no real-public-network or native-platform evidence.

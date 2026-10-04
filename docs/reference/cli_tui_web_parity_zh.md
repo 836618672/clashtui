@@ -1,8 +1,8 @@
 # CLI、TUI 与 Web 功能对齐记录
 
-更新：2026-10-02。本文是当前三端业务入口参考，不是所有交互均已通过验收的证明。当前状态和未测项见[项目状态](project_status_zh.md)，本次实机证据见[验收报告](../testing/reports/vm_acceptance_20261002_zh.md)。
+更新：2026-10-03。本文是当前三端业务入口参考，不是所有交互均已通过验收的证明。当前状态和未测项见[项目状态](project_status_zh.md)，本次实机证据见[验收报告](../testing/reports/vm_acceptance_20261002_zh.md)。
 
-Web 指 **固定 v1.273.1 MetaCubeXD 核心面板 + ClashTui 本地管理页**，二者分别连接核心 API 和本地管理服务。快捷键、鼠标、终端布局和浏览器图表保留各自交互方式。
+Web 指 **ClashTui 内置 Vue 面板**，核心和本地管理由同一个 Rust 服务提供。快捷键、鼠标、终端布局和浏览器图表保留各自交互方式。
 
 ## 核对结论
 
@@ -12,17 +12,17 @@ Web 指 **固定 v1.273.1 MetaCubeXD 核心面板 + ClashTui 本地管理页**�
 
 | 业务能力 | CLI | TUI | Web |
 |---|---|---|---|
-| 核心身份、状态、运行配置 | core status / manage runtime | Status / Settings | MetaCubeXD / 管理页 |
-| 节点列表、选择、节点/组测速 | core proxies / select / delay | Proxies | MetaCubeXD |
-| 恢复自动选组、Provider 内单节点测速 | core unfix GROUP / delay NODE --provider PROVIDER | Proxies u / Providers d | MetaCubeXD |
-| 规则、代理/规则 Provider 列表与详情 | core resources … list | Rules / Providers | MetaCubeXD |
-| Provider 单项/批量更新、健康检查、规则停用 | core resources … update/update-all/health | Rules / Providers | MetaCubeXD |
-| 连接详情、字段过滤、JSON 输出、固定集合关闭 | core connections --filter / --id / --close | Connections | MetaCubeXD |
-| 日志筛选、有限采集、导出 | core logs --level/--filter/--limit/--seconds/--output | Logs | MetaCubeXD |
-| 速率、会话量、连接数、有限历史、可用内存 | core metrics --samples/--interval-ms | Status | MetaCubeXD |
-| 自定义运行模式 | mode set VALUE | Settings 根据 mode-list 显示 | MetaCubeXD / 管理页临时 JSON |
+| 核心身份、状态、运行配置 | core status / manage runtime | Status / Settings | Vue 总览 / 设置 |
+| 节点列表、选择、节点/组测速 | core proxies / select / delay | Proxies | Vue 面板 |
+| 恢复自动选组、Provider 内单节点测速 | core unfix GROUP / delay NODE --provider PROVIDER | Proxies u / Providers d | Vue 面板 |
+| 规则、代理/规则 Provider 列表与详情 | core resources … list | Rules / Providers | Vue 面板 |
+| Provider 单项/批量更新、健康检查、规则停用 | core resources … update/update-all/health | Rules / Providers | Vue 面板 |
+| 连接详情、字段过滤、JSON 输出、固定集合关闭 | core connections --filter / --id / --close | Connections | Vue 面板 |
+| 日志筛选、有限采集、导出 | core logs --level/--filter/--limit/--seconds/--output | Logs | Vue 面板 |
+| 速率、会话量、连接数、有限历史、可用内存 | core metrics --samples/--interval-ms | Status | Vue 面板 |
+| 自定义运行模式 | mode set VALUE | Settings 根据 mode-list 显示 | Vue 设置（依据 mode-list） |
 | 临时设置、持久覆盖配置 | manage patch / persist | Settings e / p | 管理页 |
-| DNS/fake-IP 清理、GEO 更新、API 重启/升级 | core maintenance | Settings / Service | MetaCubeXD |
+| DNS/fake-IP 清理、GEO 更新、API 重启/升级 | core maintenance | Settings / Service | Vue 面板 |
 | Profile 列表、导入、新订阅、编辑名称/URL、删除 | profile list / manage import/create/rename/delete | Files | 管理页 |
 | 文件读取、版本化编辑、预览、导出 | manage read/save/preview；stdout 重定向 | Files 预览和外部编辑器；连接/日志/资源专用导出 | 管理页编辑/预览/导出 |
 | 更新、批量更新、激活 | profile update/select；manage update/update_all/activate | Files；默认 U 批量更新 | 管理页 |
@@ -34,7 +34,7 @@ Web 指 **固定 v1.273.1 MetaCubeXD 核心面板 + ClashTui 本地管理页**�
 | 生成预览、生成配置 | manage preview_template/generate | 模板 P / Enter | 管理页 |
 | 服务状态、启动/停止/重启 | service status/start/stop/restart | Service | 管理页 |
 | Windows 服务注册与系统代理 | service install/uninstall/system-proxy | Service | 管理页按平台显示 |
-| 锁定面板部署 | panel / manage prepare_panel | Status i | 管理页 |
+| 内置面板可用性 | panel / manage prepare_panel（不下载） | Status i 检查 / w 打开 | 页面内置，管理令牌认证 |
 
 项目仅管理 Mihomo。核心版本不提供的 API/字段不承诺可用；配置修改仅开放已知可写且存在的字段。
 

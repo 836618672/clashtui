@@ -9,6 +9,7 @@ fi
 report_dir="${CLASHTUI_VM_REPORT_DIR:-target/vm/results-$(date -u +%Y%m%dT%H%M%SZ)}"
 mkdir -p "$report_dir"
 export CLASHTUI_CHROMIUM_PATH="${CLASHTUI_CHROMIUM_PATH:-$(command -v chromium)}"
+export CLASHTUI_BASE_BROWSER_REPORT="$PWD/${CLASHTUI_VM_DIR:-target/vm}/browser"
 export CLASHTUI_C_BROWSER_REPORT="$PWD/$report_dir/c-browser"
 failed=0
 stage() {
@@ -39,7 +40,7 @@ bash scripts/vm.sh ssh 'sudo chgrp -R tester /home/tester/clashtui-test/config/m
 stage tui-navigation guest tests/pipeline/tui_smoke.py '/opt/clashtui/bin/clashtui /home/tester/clashtui-test/config'
 stage tui-operations guest scripts/vm-tui-live.py
 stage browser node scripts/vm-browser.mjs
-cp -a target/vm/browser "$report_dir/base-browser"
+cp -a "$CLASHTUI_BASE_BROWSER_REPORT" "$report_dir/base-browser"
 stage c-workflows guest scripts/vm-c-workflows.py
 stage c-workflows-report fetch /home/tester/clashtui-test/acceptance-c/report.json c-workflows.json
 prepare_fixture() {

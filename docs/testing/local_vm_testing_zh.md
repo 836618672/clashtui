@@ -23,7 +23,7 @@ bash scripts/vm.sh check
 bash scripts/vm.sh ssh
 ```
 
-固定端口：宿主 `127.0.0.1:22222` 是客机 SSH；`http://127.0.0.1:29090/ui/` 是客机 MetaCubeXD，`http://127.0.0.1:29091/` 是客机本地管理页。没有向宿主转发代理端口 7890。使用前脚本检查 SSH 端口占用，隧道创建也检查绑定失败。控制端口只绑定宿主回环地址。
+固定端口：宿主 `127.0.0.1:22222` 是客机 SSH；`http://127.0.0.1:29090/` 是客机核心 API，`http://127.0.0.1:29091/` 是统一 Vue 面板。没有向宿主转发代理端口 7890。使用前脚本检查 SSH 端口占用，隧道创建也检查绑定失败。控制端口只绑定宿主回环地址。
 
 ## 传入构建和配置测试服务
 
@@ -31,12 +31,12 @@ bash scripts/vm.sh ssh
 
 ```sh
 cargo build --locked --all-features
-bash scripts/vm.sh push --mihomo /path/to/mihomo --panel /path/to/compressed-dist.tgz
+bash scripts/vm.sh push --mihomo /path/to/mihomo
 bash scripts/vm.sh ssh 'bash /opt/clashtui/setup.sh'
 bash scripts/vm.sh tunnel
 ```
 
-面板归档必须与 MetaCubeXD v1.273.1 的锁定 SHA-256 一致。初始化脚本只允许在名为 `clashtui-test` 的客机中由 `tester` 用户运行，并拒绝覆盖已存在的测试配置。
+Vue 面板已包含在 ClashTui 中，无需面板归档。初始化脚本只允许在名为 `clashtui-test` 的客机中由 `tester` 用户运行，并拒绝覆盖已存在的测试配置。
 
 客机有两个独立 systemd 服务：`clashtui-test-mihomo`、`clashtui-test-web`。测试配置位于 `/home/tester/clashtui-test/config`；默认 TUN、DNS、LAN 访问和 Geo 自动更新均关闭。核心 API 只监听客机回环 9090，本地管理页只监听客机回环 9091。管理令牌和核心密钥在客机内分别生成，不复制宿主密钥。
 
@@ -48,7 +48,7 @@ clashtui --config-dir=/home/tester/clashtui-test/config
 cat /home/tester/clashtui-test/config/management-token
 ```
 
-将最后一条显示的测试令牌填入本地管理页。MetaCubeXD 使用客机的核心密钥，可在客机内通过 Python 读取覆盖配置中的 `secret`；端点填写 `http://127.0.0.1:29090`。这些令牌仅用于客机测试，仍应保存在本地。
+将最后一条显示的测试令牌填入统一 Vue 页面。核心凭据由 Rust 读取，浏览器无需填写。
 
 ## 快照、恢复和关闭
 
@@ -76,8 +76,10 @@ checkpoint/reset 都拒绝操作正在运行的磁盘；已存在的基线不会
 
 ## 测试范围
 
-默认禁止外连的环境适合真实核心校验、CLI/TUI/管理页入口、面板加载、服务启停与重启、配置激活/恢复、文件事务、Provider 回环订阅及失败注入。此前[Provider 审查](../archive/three_client_provider_review_zh.md)中的四项问题已修复并加入 VM 回归；失败注入只使用客机测试文件。
+默认禁止外连的环境适合真实核心校验、CLI/TUI/管理页入口、面板加载、服务启停与重启、配置激活/恢复、文件事务、Provider 回环订阅及失败注入。此前[Provider 审查](../archive/README.md#providers)中的四项问题已修复并加入 VM 回归；失败注入只使用客机测试文件。
 
 真实公网代理、订阅下载或更新需要关闭客机后显式执行 `start --internet`，这会允许客机通过用户态 NAT 外连，包括访问可路由的宿主/LAN 地址；没有设置网桥或更改宿主默认路由。完成联网用例后恢复默认启动。涉及 TUN/DNS 的测试只在客机中进行，完成后恢复基线；本机环境不覆盖 macOS/Windows 验收。
 
 搭建、启动成功不代表完整验收通过。按[测试方案](README.md)分别记录自动、待补、人工体验和平台专项；原 M 用例仅按需复现。
+
+可用 `CLASHTUI_VM_DIR=target/vue-vm` 与 `CLASHTUI_VM_SSH_PORT=22223`、`CLASHTUI_VM_CORE_PORT=29190`、`CLASHTUI_VM_WEB_PORT=29191` 建立第二套隔离环境，避免重置正在进行 Mac 人工测试的原 VM。目录必须位于项目 target 内，端口互异；浏览器脚本读取同一组环境变量。

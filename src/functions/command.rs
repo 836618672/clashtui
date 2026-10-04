@@ -276,7 +276,7 @@ pub fn open_dir(path: &str) -> Result<()> {
 }
 
 pub fn open_panel() -> Result<()> {
-    let url = format!("{}/ui/", CONFIG.controller_for_core().trim_end_matches('/'));
+    let url = super::file::panel::url();
     anyhow::ensure!(
         url.starts_with("http://") || url.starts_with("https://"),
         "Panel endpoint must use HTTP or HTTPS"

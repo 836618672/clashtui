@@ -27,7 +27,7 @@
 | 最低 Rust 1.89.0 | offline/locked 全特性及 CLI 编译通过；CLI 保留既有未使用代码警告 | `target/vm/msrv-all.log`、`msrv-cli.log` |
 | 真实 Linux VM | 32 组通过、0 失败、0 已知失败、1 能力跳过 | `target/vm/results-20261002T012751Z/report.json` |
 
-先前 27 通过、1 新失败、4 已知失败的报告 `target/vm/results-20261002T010228Z/report.json` 保留为修复前证据。四项 Provider 的历史审查见 [Provider 审查](../../archive/three_client_provider_review_zh.md)。测试入口现在将五项用例计为普通回归，任何失败都会让流水线退出非零。
+先前 27 通过、1 新失败、4 已知失败的报告 `target/vm/results-20261002T010228Z/report.json` 保留为修复前证据。四项 Provider 的历史审查见 [Provider 审查](../../archive/README.md#providers)。测试入口现在将五项用例计为普通回归，任何失败都会让流水线退出非零。
 
 ## 真实测试范围
 

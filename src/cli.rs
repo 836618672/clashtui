@@ -70,9 +70,9 @@ impl Cmds {
 #[derive(clap::Subcommand)]
 #[cfg_attr(debug_assertions, derive(Debug))]
 pub(crate) enum ArgCommand {
-    /// Download and verify the pinned MetaCubeXD panel for the selected core
+    /// Verify the bundled ClashTui dashboard (no download needed)
     Panel,
-    /// Serve the local management companion for MetaCubeXD
+    /// Serve the bundled ClashTui core dashboard and local management
     Web {
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: std::net::SocketAddr,

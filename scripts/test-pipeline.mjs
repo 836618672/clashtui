@@ -10,7 +10,7 @@ import {randomUUID} from 'node:crypto';
 const root=resolve(dirname(fileURLToPath(import.meta.url)),'..');
 const options=new Set(process.argv.slice(2));
 if([...options].some(option=>!['--browser','--help'].includes(option)))throw new Error('Unknown option; use --help');
-if(options.has('--help')){console.log('node scripts/test-pipeline.mjs [--browser]\nRequires Rust (rustfmt/clippy), Node 22+ and Python 3 (Linux PTY stage).\nDefault: fmt, clippy, Rust feature builds/tests, mock DOM, Linux CLI/API and PTY workflows.\n--browser: additionally run installed Playwright against isolated mock fixtures.\nNo core downloads, installations, TUN, system proxy or real service operations.');process.exit(0);}
+if(options.has('--help')){console.log('node scripts/test-pipeline.mjs [--browser]\nRequires Rust (rustfmt/clippy), Node 22+ and Python 3 (Linux PTY stage).\nDefault: fmt, clippy, Rust feature builds/tests, Vue unit tests, Linux CLI/API and PTY workflows.\n--browser: additionally run installed Playwright against isolated mock fixtures.\nNo core downloads, installations, TUN, system proxy or real service operations.');process.exit(0);}
 const reportDir=resolve(process.env.CLASHTUI_REPORT_DIR||join(root,'target','test-results',`${Date.now()}-${randomUUID().slice(0,8)}`));
 await mkdir(reportDir,{recursive:true});
 const results=[];
@@ -25,18 +25,22 @@ async function stage(name,command,args,{skip}={}){
   if(interrupted)skip='Pipeline interrupted';
   if(skip){results.push({name,status:'skipped',reason:skip});console.log(`SKIP ${name}: ${skip}`);return;}
   console.log(`RUN ${name}`);const started=Date.now();const logPath=join(reportDir,`${name}.log`);const log=createWriteStream(logPath);
-  let status='failed',error;const child=spawn(command,args,{cwd:root,env,detached:process.platform!=='win32',stdio:['ignore','pipe','pipe']});activeChild=child;
+  let status='failed',error;const child=spawn(command,args,{cwd:root,env,shell:process.platform==='win32'&&command==='npm',detached:process.platform!=='win32',stdio:['ignore','pipe','pipe']});activeChild=child;
   child.stdout.pipe(log,{end:false});child.stderr.pipe(log,{end:false});
   let timedOut=false;const timer=setTimeout(()=>{timedOut=true;killStage('SIGKILL');},20*60*1000);
   try{const code=await new Promise((resolve,reject)=>{child.once('error',reject);child.once('close',resolve);});status=code===0&&!interrupted?'passed':'failed';if(status==='failed')error=timedOut?'Stage timed out':interrupted?'Pipeline interrupted':`exit ${code}`;}catch(e){error=e.message;}finally{clearTimeout(timer);activeChild=undefined;await new Promise(r=>log.end(r));}
   results.push({name,status,error,duration_ms:Date.now()-started,log:logPath});console.log(`${status.toUpperCase()} ${name}${error?`: ${error}`:''}`);
 }
+await stage('frontend-dependencies','npm',['ci','--prefix','web','--no-audit','--no-fund']);
+await stage('frontend-build','npm',['run','build','--prefix','web']);
+await stage('frontend-test','npm',['test','--prefix','web']);
+await stage('frontend-consistency',process.execPath,['web/scripts/build-manifest.mjs','--check']);
 await stage('format','cargo',['fmt','--all','--','--check']);
 await stage('clippy','cargo',['clippy','--locked','--all-targets','--all-features','--','-D','warnings']);
 await stage('rust-all-features','cargo',['test','--locked','--all-features']);
 await stage('rust-cli-only','cargo',['test','--locked','--no-default-features']);
 await stage('build-tui','cargo',['build','--locked','--all-features']);
-await stage('web-dom',process.execPath,['--test','web/index.test.cjs']);
+
 // Cargo metadata respects a custom CARGO_TARGET_DIR; the fixture never guesses
 // another executable if the explicitly supplied build is missing.
 let metadata='';

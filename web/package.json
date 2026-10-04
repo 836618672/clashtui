@@ -1,0 +1,29 @@
+{
+  "name": "clashtui-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vue-tsc --noEmit && vite build && node scripts/build-manifest.mjs",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run",
+    "check:build": "node scripts/build-manifest.mjs --check"
+  },
+  "dependencies": {
+    "echarts": "^6.0.0",
+    "lucide-vue-next": "^0.468.0",
+    "pinia": "^3.0.0",
+    "vue": "^3.5.0",
+    "vue-router": "^4.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.0",
+    "prettier": "3.9.9",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0",
+    "vite-plugin-singlefile": "^2.3.0",
+    "vitest": "^3.2.0",
+    "vue-tsc": "^3.0.0"
+  }
+}

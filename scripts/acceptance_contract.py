@@ -20,7 +20,7 @@ def manual_result(record, binary_sha256):
     if not isinstance(record, dict) or not binary_sha256:
         return False
     return (record.get('binary_sha256') == binary_sha256 and record.get('core_version') == '1.19.24'
-            and record.get('panel_version') == 'v1.273.1' and bool(record.get('browser'))
+            and record.get('dashboard') == 'builtin-vue' and bool(record.get('browser'))
             and bool(record.get('terminal')) and isinstance(record.get('checks'), dict)
             and all(isinstance(record['checks'].get(f'H{i:02}'), dict)
                     and record['checks'][f'H{i:02}'].get('status') == 'passed'

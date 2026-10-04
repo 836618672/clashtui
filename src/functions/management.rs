@@ -89,7 +89,7 @@ pub fn snapshot() -> Result<Value> {
         json!({"core": CONFIG.core_type().to_string(), "profiles": profiles,
         "current": profile::db::get_current().name, "templates": template::get_all_templates()?,
         "revision": revision(&db), "service_running": crate::functions::command::is_core_service_running(),
-        "metacubexd": file::panel::VERSION, "panel_deployment": file::panel::deployment_state(), "system_proxy": system_proxy_state(), "service_install": cfg!(windows), "panel": format!("{}/ui/", CONFIG.controller_for_core().trim_end_matches('/'))}),
+        "dashboard": file::panel::deployment_state(), "system_proxy": system_proxy_state(), "service_install": cfg!(windows), "panel": file::panel::url()}),
     )
 }
 
@@ -288,22 +288,26 @@ pub fn execute(value: Value) -> Result<Value> {
             anyhow::ensure!(profile::db::get(name).is_none(), "Profile already exists");
             let url = text(&value, "url")?;
             profile::validate_subscription_url(url)?;
-            let mut response = super::restful::download::profile(
-                url,
-                value["with_proxy"].as_bool().unwrap_or(false),
-            )?;
+            let with_proxy = value["with_proxy"].as_bool().unwrap_or(false);
+            let mut response = super::restful::download::profile(url, with_proxy)?;
             let mut content = String::new();
             std::io::Read::read_to_string(&mut response, &mut content)?;
             import_content(
                 name,
                 &content,
                 crate::config::database::ProfileType::Url(url.to_owned()),
+                with_proxy,
             )?;
         }
         "rename" => profile::edit_profile(name, text(&value, "new_name")?, value["url"].as_str())?,
         "import" => {
             let content = text(&value, "content")?;
-            import_content(name, content, crate::config::database::ProfileType::File)?;
+            import_content(
+                name,
+                content,
+                crate::config::database::ProfileType::File,
+                false,
+            )?;
         }
         "delete" | "update" | "activate" | "no_pp" | "with_proxy" => {
             let pf = profile::db::get(name).context("Profile not found")?;
@@ -449,6 +453,7 @@ fn import_content(
     name: &str,
     content: &str,
     dtype: crate::config::database::ProfileType,
+    with_proxy: bool,
 ) -> Result<()> {
     profile::validate_profile_name(name)?;
     anyhow::ensure!(profile::db::get(name).is_none(), "Profile already exists");
@@ -458,6 +463,7 @@ fn import_content(
     file::activation::atomic_write(&path, content.as_bytes())?;
     let mut db = file::coordination::database();
     db.insert(name, dtype);
+    db.set_update_with_proxy(name, with_proxy);
     if let Err(error) = db.to_file() {
         db.remove(name);
         let cleanup = std::fs::remove_file(&path);
@@ -503,6 +509,105 @@ fn parse_userinfo(header: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct TestDocument(PathBuf);
+    impl TestDocument {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!("clashtui-unit-document-{}", fastrand::u64(..))))
+        }
+    }
+    impl Drop for TestDocument {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    #[test]
+    fn invalid_edits_preserve_existing_documents_byte_for_byte() {
+        for (json_format, original, invalid) in [
+            (
+                true,
+                "{\"mode\":\"rule\"}\n",
+                vec!["{unfinished", "[]", "null", "42"],
+            ),
+            (
+                false,
+                "# retain comment\nmode: rule\n",
+                vec!["[unfinished", "[]", "42"],
+            ),
+        ] {
+            let file = TestDocument::new();
+            std::fs::write(&file.0, original).unwrap();
+            for content in invalid {
+                assert!(
+                    save_document_at(
+                        &file.0,
+                        content,
+                        &revision(original.as_bytes()),
+                        json_format
+                    )
+                    .is_err(),
+                    "{content}"
+                );
+                assert_eq!(std::fs::read(&file.0).unwrap(), original.as_bytes());
+            }
+        }
+    }
+    #[test]
+    fn a_new_document_requires_the_empty_revision_and_valid_content() {
+        let file = TestDocument::new();
+        assert!(save_document_at(&file.0, "mode: rule\n", &revision(b"old"), false).is_err());
+        assert!(!file.0.exists());
+        assert!(save_document_at(&file.0, "[unfinished", &revision(b""), false).is_err());
+        assert!(!file.0.exists());
+        save_document_at(&file.0, "mode: rule\n", &revision(b""), false).unwrap();
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), "mode: rule\n");
+    }
+    #[test]
+    fn successful_save_invalidates_the_previous_editor_revision() {
+        let file = TestDocument::new();
+        std::fs::write(&file.0, "mode: rule\n").unwrap();
+        let old = revision(b"mode: rule\n");
+        save_document_at(&file.0, "mode: direct\n", &old, false).unwrap();
+        assert!(
+            save_document_at(&file.0, "mode: global\n", &old, false)
+                .unwrap_err()
+                .to_string()
+                .contains("Revision conflict")
+        );
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), "mode: direct\n");
+        save_document_at(
+            &file.0,
+            "mode: global\n",
+            &revision(b"mode: direct\n"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&file.0).unwrap(), "mode: global\n");
+    }
+    #[test]
+    fn runtime_persistence_preserves_local_only_fields_and_ignores_nulls() {
+        let mut overlay = json!({"mode":"rule", "secret":"local-secret", "custom":7,
+            "tun":{"enable":false,"stack":"mixed","device":"local-tun","auto-route":false}});
+        merge_runtime(
+            &json!({"mode":null,"secret":"remote-secret","custom":9,
+            "tun":{"enable":true,"stack":"system","device":"remote-tun","auto-route":true}}),
+            &mut overlay,
+            CoreType::Mihomo,
+        )
+        .unwrap();
+        assert_eq!(
+            overlay,
+            json!({"mode":"rule", "secret":"local-secret", "custom":7,
+            "tun":{"enable":true,"stack":"system","device":"local-tun","auto-route":false}})
+        );
+    }
+    #[test]
+    fn subscription_quota_parses_zero_missing_and_invalid_values() {
+        assert_eq!(parse_userinfo(""), json!({"used":0}));
+        let usage = parse_userinfo(
+            "upload=-1; download=12; total=bad; expire=0; extra=18446744073709551616",
+        );
+        assert_eq!(usage, json!({"download":12,"expire":0,"used":12}));
+    }
     #[test]
     fn persisting_runtime_handles_null_sections_and_rejects_scalars_without_panicking() {
         let mut overlay = json!({"tun":null});

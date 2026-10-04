@@ -147,15 +147,29 @@ pub fn compare(
                     .flat_map(char::to_lowercase)
                     .collect::<String>()
             };
+            let expected_type = normalized(kind);
+            let actual_type = normalized(actual["type"].as_str().unwrap_or(""));
+            // Mihomo reports both IPv4 and IPv6 CIDR rules as IPCIDR.
+            // Payload and target checks below still distinguish their meaning.
             ensure!(
-                normalized(kind) == normalized(actual["type"].as_str().unwrap_or("")),
+                expected_type == actual_type
+                    || (expected_type == "ipcidr6" && actual_type == "ipcidr"),
                 "Activation readback rule type mismatch at {index}"
             );
             if !matches!(kind, "AND" | "OR" | "NOT" | "SUB-RULE") {
                 let parts: Vec<_> = rule.split(',').collect();
                 if kind != "MATCH" && parts.len() >= 3 {
+                    let expected_payload = parts[1].trim();
+                    let actual_payload = actual["payload"].as_str();
+                    // GeoIP's API uses lowercase ISO country codes.
+                    let equal = if kind.eq_ignore_ascii_case("GEOIP") {
+                        actual_payload
+                            .is_some_and(|payload| expected_payload.eq_ignore_ascii_case(payload))
+                    } else {
+                        actual_payload == Some(expected_payload)
+                    };
                     ensure!(
-                        actual["payload"].as_str() == Some(parts[1].trim()),
+                        equal,
                         "Activation readback rule payload mismatch at {index}"
                     );
                 }
@@ -230,6 +244,65 @@ mod tests {
                 &runtime,
                 &proxies,
                 Some(&stale)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn ipv6_cidr_api_alias_is_accepted_without_relaxing_payload_or_target_checks() {
+        let expected = json!({"rules":["IP-CIDR6,2001:db8::/32,DIRECT,no-resolve"]});
+        let proxies = json!({"proxies":{}});
+        let rules = json!({"rules":[{"type":"IPCIDR","payload":"2001:db8::/32","proxy":"DIRECT"}]});
+        compare(
+            &expected,
+            CoreType::Mihomo,
+            &json!({}),
+            &proxies,
+            Some(&rules),
+        )
+        .unwrap();
+        for (field, wrong) in [
+            ("type", "Domain"),
+            ("payload", "2001:db9::/32"),
+            ("proxy", "REJECT"),
+        ] {
+            let mut stale = rules.clone();
+            stale["rules"][0][field] = json!(wrong);
+            assert!(
+                compare(
+                    &expected,
+                    CoreType::Mihomo,
+                    &json!({}),
+                    &proxies,
+                    Some(&stale)
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn geoip_country_case_is_normalized_but_different_countries_are_rejected() {
+        let expected = json!({"rules":["GEOIP,CN,DIRECT"]});
+        let proxies = json!({"proxies":{}});
+        let mut rules = json!({"rules":[{"type":"GeoIP","payload":"cn","proxy":"DIRECT"}]});
+        compare(
+            &expected,
+            CoreType::Mihomo,
+            &json!({}),
+            &proxies,
+            Some(&rules),
+        )
+        .unwrap();
+        rules["rules"][0]["payload"] = json!("us");
+        assert!(
+            compare(
+                &expected,
+                CoreType::Mihomo,
+                &json!({}),
+                &proxies,
+                Some(&rules)
             )
             .is_err()
         );

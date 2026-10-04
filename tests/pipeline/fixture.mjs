@@ -33,6 +33,7 @@ export async function fixture() {
     if(req.headers.authorization!==`Bearer ${secret}`) return send({error:'auth'},401);
     if(faults.has(path)) return send({error:`mock HTTP ${faults.get(path)}`},faults.get(path));
     if(delays.has(path)) await new Promise(resolve=>setTimeout(resolve,delays.get(path)));
+    if(path==='/dns/query') return send({Question:[{Name:url.searchParams.get('name'),Type:url.searchParams.get('type')}],Answer:[{Data:'192.0.2.1'}]});
     if(path==='/version') return send(backend);
     if(path==='/configs') {if(req.method==='PATCH') Object.assign(state,JSON.parse(body));return send(state);}
     if(path==='/proxies') return send({proxies});
@@ -52,13 +53,17 @@ export async function fixture() {
   });
   const sockets=new Set();
   core.on('upgrade',(req,socket)=>{
+    socket.streamPath=req.url;
     sockets.add(socket);socket.once('close',()=>sockets.delete(socket));
     if(req.headers.authorization!==`Bearer ${secret}`){socket.end('HTTP/1.1 401 Unauthorized\r\n\r\n');return;}
+    if(faults.has(new URL(req.url,'http://localhost').pathname)){socket.end('HTTP/1.1 503 Unavailable\r\n\r\n');return;}
     requests.push({method:'WS',path:req.url,auth:req.headers.authorization});
     const accept=createHash('sha1').update(req.headers['sec-websocket-key']+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
     socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`);
-    const payload=Buffer.from(JSON.stringify(req.url.startsWith('/memory')?{inuse:1024}:{type:'info',payload:'mock log preserved'}));
-    socket.write(Buffer.concat([Buffer.from([0x81,payload.length]),payload]));
+    const value=req.url.startsWith('/memory')?{inuse:1024}:req.url.startsWith('/traffic')?{up:10,down:20}:req.url.startsWith('/connections')?{downloadTotal:100,uploadTotal:50,connections}:{type:'info',payload:'mock log preserved'};
+    const payload=Buffer.from(JSON.stringify(value));
+    const header=payload.length<126?Buffer.from([0x81,payload.length]):Buffer.from([0x81,126,payload.length>>8,payload.length&255]);
+    socket.write(Buffer.concat([header,payload]));
     socket.on('data',()=>socket.end());socket.on('error',()=>{});
   });
   core.listen(0,'127.0.0.1');await once(core,'listening');
@@ -81,14 +86,17 @@ export async function fixture() {
     try{const [code]=await once(child,'close');if(code===null)throw new Error(`${args.join(' ')}: terminated (${child.signalCode}); ${stderr}`);if((code===0)!==success)throw new Error(`${args.join(' ')}: exit ${code}: ${stderr}`);return {stdout,stderr,code};}finally{clearTimeout(timer);}
   }
   const json=async args=>JSON.parse((await run(args)).stdout);
-  let web;
+  let web,webPort;
   async function startWeb(){
-    const reservation=createServer();reservation.listen(0,'127.0.0.1');await once(reservation,'listening');const port=reservation.address().port;await new Promise(r=>reservation.close(r));
+    const reservation=createServer();reservation.listen(webPort||0,'127.0.0.1');await once(reservation,'listening');const port=reservation.address().port;webPort=port;await new Promise(r=>reservation.close(r));
     const token='mock-independent-management-token';const tokenFile=join(root,'token');await writeFile(tokenFile,token,{mode:0o600});
     web=start(['web','--listen',`127.0.0.1:${port}`,'--token-file',tokenFile]);web.stderr.resume();web.stdout.resume();
     const url=`http://127.0.0.1:${port}`;
     for(let i=0;i<100;i++){try{if((await fetch(url,{signal:AbortSignal.timeout(500)})).ok)return {url,token};}catch{}if(web.startupError)throw web.startupError;if(web.exitCode!==null)throw new Error('Web fixture exited');await new Promise(r=>setTimeout(r,20));}throw new Error('Web startup timed out');
   }
   async function close(){for(const child of children){if(child.pid){child.kill('SIGKILL');await once(child,'close').catch(()=>{});}}for(const socket of sockets)socket.destroy();core.closeAllConnections();await new Promise(r=>core.close(r));await rm(root,{recursive:true,force:true});}
-  return {root,binary,secret,endpoint,state,backend,group,node,provider,requests,connections,rules,faults,delays,start,run,json,startWeb,close};
+  async function restartWeb(){web.kill('SIGTERM');await once(web,'close');return startWeb();}
+  function disconnectStreams(){for(const socket of sockets)socket.destroy();}
+  function emitLog(value){const payload=Buffer.from(JSON.stringify(value));const header=payload.length<126?Buffer.from([0x81,payload.length]):Buffer.from([0x81,126,payload.length>>8,payload.length&255]);for(const socket of sockets)if(socket.streamPath.startsWith('/logs'))socket.write(Buffer.concat([header,payload]));}
+  return {root,binary,secret,endpoint,state,backend,group,node,provider,requests,connections,rules,faults,delays,start,run,json,startWeb,close,restartWeb,disconnectStreams,emitLog};
 }

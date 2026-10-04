@@ -13,7 +13,7 @@ import os
 ROOT = Path(__file__).resolve().parent.parent
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--subscription-file', type=Path, required=True)
-parser.add_argument('--panel-archive', type=Path, default=Path('/tmp/clashtui-metacubexd-dist.tgz'))
+parser.add_argument('--panel-archive', type=Path, help='Deprecated compatibility argument; Vue dashboard is bundled')
 parser.add_argument('--soak-seconds', type=int, default=600)
 parser.add_argument('--resume', type=Path, help='Reuse passed scopes only when binary and source manifests still match')
 args = parser.parse_args()
@@ -93,7 +93,7 @@ for suite in ['public', 'lifecycle', 'system-lifecycle', 'upgrades']:
     if suite in ['public', 'upgrades']: command += ['--subscription-file', str(args.subscription_file.resolve())]
     if not reuse(suite, binary_hash): execute(suite, command, ROOT / 'target/extended-acceptance')
 if not reuse('abc-soak', binary_hash):
-    execute('abc-soak', ['bash', 'scripts/acceptance.sh', '--panel-archive', str(args.panel_archive.resolve()),
+    execute('abc-soak', ['bash', 'scripts/acceptance.sh',
         '--soak-seconds', str(args.soak_seconds)], ROOT / 'target/acceptance')
 report = {'suites': results, 'binary_sha256': binary_hash,
           'automatic_available_scopes_passed': not interrupted and len(results) == 5 and all(r['passed'] and r.get('binary_sha256') == binary_hash for r in results),

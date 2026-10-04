@@ -28,6 +28,6 @@ Linux uses systemd/OpenRC, macOS launchd and Windows NSSM. Windows service regis
 
 ## Interfaces and verification
 
-The TUI has nine tabs. Optional mihomo keymap/theme sections override common settings. The current Web interface combines the pinned original MetaCubeXD panel with a local management companion; upstream frontend integration has not been implemented.
+The TUI has nine tabs. Optional mihomo keymap/theme sections override common settings. The Web interface is now a bundled Vue 3 + TypeScript + Vite dashboard for both core and local management workflows; see [implementation](web_dashboard_zh.md).
 
 See [architecture](architecture_en.md), [the CLI/TUI/Web matrix](../reference/cli_tui_web_parity_zh.md) and [the isolated test pipeline](../testing/test_pipeline_zh.md). Real core, service, TUN and network acceptance requires an isolated VM; mock coverage is not real-core evidence.

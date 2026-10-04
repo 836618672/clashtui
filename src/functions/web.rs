@@ -1,4 +1,4 @@
-//! Authenticated companion for local Profile/template/service workflows.
+//! Authenticated core dashboard and local Profile/template/service workflows.
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::io::Read;
@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tiny_http::{Header, Response, Server, StatusCode};
+mod core;
 type JobState = Arc<Mutex<Option<(u64, Option<Value>)>>>;
 
 fn record_task(id: u64, action: &str, state: &str, result: Option<&Value>) -> Result<()> {
@@ -45,6 +46,7 @@ pub fn serve(listen: SocketAddr, token_file: &Path) -> Result<()> {
     );
     let server = Server::http(listen).map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let job: JobState = Arc::default();
+    let streams = core::Streams::start();
     if let Ok(bytes) = std::fs::read(crate::config::config_dir_path().join(".web-task.json"))
         && let Ok(previous) = serde_json::from_slice::<Value>(&bytes)
         && let Some(id) = previous["id"]
@@ -53,130 +55,187 @@ pub fn serve(listen: SocketAddr, token_file: &Path) -> Result<()> {
     {
         *job.lock().unwrap() = Some((id, Some(recovered_result(&previous))));
     }
-    eprintln!("Management companion: http://{listen}/ (MetaCubeXD v1.273.1)");
-    for mut request in server.incoming_requests() {
-        let (status, content_type, body) = if request.method().as_str() == "GET"
-            && request.url() == "/"
-        {
-            (
-                200,
-                "text/html; charset=utf-8",
-                include_str!("../../web/index.html").to_owned(),
-            )
-        } else if !authorized(request.headers(), token) {
-            (
-                401,
-                "application/json",
-                serde_json::json!({"error":"Management authentication required"}).to_string(),
-            )
-        } else {
-            let result = match (request.method().as_str(), request.url()) {
-                ("GET", "/api/job") => Ok(match job.lock().unwrap().as_ref() {
-                    Some((id, result)) => {
-                        json!({"id":id.to_string(),"pending":result.is_none(),"result":result})
-                    }
-                    None => json!({"pending":false}),
-                }),
-                ("GET", "/api/state") => {
-                    if job
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .is_some_and(|(_, result)| result.is_none())
-                    {
-                        Err(anyhow::anyhow!(
-                            "Management operation is running; wait for its result"
-                        ))
-                    } else {
-                        super::management::snapshot()
-                    }
-                }
-                ("POST", "/api/action") => (|| {
-                    let mut bytes = Vec::new();
-                    request
-                        .as_reader()
-                        .take(2 * 1024 * 1024 + 1)
-                        .read_to_end(&mut bytes)?;
-                    anyhow::ensure!(
-                        bytes.len() <= 2 * 1024 * 1024,
-                        "Request exceeds 2 MiB limit"
-                    );
-                    let value: Value = serde_json::from_slice(&bytes)?;
-                    let mut state = job.lock().unwrap();
-                    anyhow::ensure!(
-                        !state.as_ref().is_some_and(|(_, result)| result.is_none()),
-                        "Another operation is running"
-                    );
-                    let id = fastrand::u64(..);
-                    let action = value["action"].as_str().unwrap_or("unknown").to_owned();
-                    record_task(id, &action, "running", None)?;
-                    *state = Some((id, None));
-                    let job = Arc::clone(&job);
-                    let task_token = token.to_owned();
-                    std::thread::spawn(move || {
-                        super::command::BACKGROUND.with(|background| background.set(true));
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            super::management::execute(value)
-                        }));
-                        let mut result = match result {
-                            Ok(Ok(value)) => json!({"ok":true,"value":value}),
-                            Ok(Err(error)) => {
-                                json!({"ok":false,"error":error.to_string().replace(&task_token, "[redacted]")})
-                            }
-                            Err(_) => {
-                                json!({"ok":false,"error":"Management task failed unexpectedly; refresh before retrying"})
-                            }
-                        };
-                        if let Err(error) = record_task(
-                            id,
-                            &action,
-                            if result["ok"] == true {
-                                "completed"
-                            } else {
-                                "failed"
-                            },
-                            Some(&result),
-                        ) {
-                            result = json!({"ok":false,"operation_result":result,"error":format!("Operation finished but its recovery record could not be saved: {}. Refresh before retrying.", error.to_string().replace(&task_token, "[redacted]"))});
-                        }
-                        *job.lock().unwrap() = Some((id, Some(result)));
-                    });
-                    Ok(json!({"job":id.to_string()}))
-                })(),
-                _ => Err(anyhow::anyhow!("Route not found")),
-            };
-            match result {
-                Ok(value) => (200, "application/json", value.to_string()),
-                Err(error) => {
-                    let message = error.to_string();
-                    let status = if message.starts_with("Management state is busy") {
-                        503
-                    } else if message.contains("Revision conflict") {
-                        409
-                    } else if message == "Route not found" {
-                        404
-                    } else {
-                        400
-                    };
-                    (
-                        status,
-                        "application/json",
-                        serde_json::json!({"error":message.replace(token, "[redacted]")})
-                            .to_string(),
-                    )
-                }
+    eprintln!("Management companion: http://{listen}/ (ClashTui Vue dashboard)");
+    // Slow core reads have a bounded pool; local state, jobs and actions keep
+    // their own dispatch lane even when every read worker is waiting on Mihomo.
+    let (send, receive) = std::sync::mpsc::sync_channel::<tiny_http::Request>(16);
+    let receive = Arc::new(Mutex::new(receive));
+    for _ in 0..4 {
+        let receive = Arc::clone(&receive);
+        let token = token.to_owned();
+        let job = Arc::clone(&job);
+        let streams = streams.clone();
+        std::thread::spawn(move || {
+            super::command::BACKGROUND.with(|background| background.set(true));
+            loop {
+                let request = match receive.lock().unwrap().recv() {
+                    Ok(request) => request,
+                    Err(_) => break,
+                };
+                handle_request(request, &token, &job, &streams);
             }
-        };
-        let response = Response::from_string(body)
-            .with_status_code(StatusCode(status))
-            .with_header(Header::from_bytes("Content-Type", content_type).unwrap())
-            .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap())
-            .with_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap())
-            .with_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap())
-            .with_header(Header::from_bytes("X-Frame-Options", "DENY").unwrap());
-        let _ = request.respond(response);
+        });
+    }
+    for request in server.incoming_requests() {
+        if request.method().as_str() == "POST"
+            && request.url() == "/api/core/read"
+            && authorized(request.headers(), token)
+        {
+            if let Err(error) = send.try_send(request) {
+                let request = match error {
+                    std::sync::mpsc::TrySendError::Full(request)
+                    | std::sync::mpsc::TrySendError::Disconnected(request) => request,
+                };
+                let _ = request.respond(
+                    Response::from_string(
+                        json!({"error":"Core read capacity is busy; retry shortly"}).to_string(),
+                    )
+                    .with_status_code(StatusCode(503))
+                    .with_header(Header::from_bytes("Content-Type", "application/json").unwrap())
+                    .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap()),
+                );
+            }
+        } else {
+            handle_request(request, token, &job, &streams);
+        }
     }
     Ok(())
+}
+
+fn handle_request(
+    mut request: tiny_http::Request,
+    token: &str,
+    job: &JobState,
+    streams: &core::Streams,
+) {
+    let (status, content_type, body) = if request.method().as_str() == "GET" && request.url() == "/"
+    {
+        (
+            200,
+            "text/html; charset=utf-8",
+            super::file::panel::HTML.to_owned(),
+        )
+    } else if !authorized(request.headers(), token) {
+        (
+            401,
+            "application/json",
+            serde_json::json!({"error":"Management authentication required"}).to_string(),
+        )
+    } else {
+        let result = match (request.method().as_str(), request.url()) {
+            ("GET", "/api/job") => Ok(match job.lock().unwrap().as_ref() {
+                Some((id, result)) => {
+                    json!({"id":id.to_string(),"pending":result.is_none(),"result":result})
+                }
+                None => json!({"pending":false}),
+            }),
+            ("GET", "/api/state") => {
+                if job
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|(_, result)| result.is_none())
+                {
+                    Err(anyhow::anyhow!(
+                        "Management operation is running; wait for its result"
+                    ))
+                } else {
+                    super::management::snapshot()
+                }
+            }
+            ("POST", "/api/core/read") => (|| {
+                let mut bytes = Vec::new();
+                request.as_reader().take(65537).read_to_end(&mut bytes)?;
+                anyhow::ensure!(bytes.len() <= 65536, "Request exceeds 64 KiB limit");
+                core::read(&serde_json::from_slice::<Value>(&bytes)?, streams)
+            })(),
+            ("POST", "/api/action") => (|| {
+                let mut bytes = Vec::new();
+                request
+                    .as_reader()
+                    .take(2 * 1024 * 1024 + 1)
+                    .read_to_end(&mut bytes)?;
+                anyhow::ensure!(
+                    bytes.len() <= 2 * 1024 * 1024,
+                    "Request exceeds 2 MiB limit"
+                );
+                let value: Value = serde_json::from_slice(&bytes)?;
+                let mut state = job.lock().unwrap();
+                anyhow::ensure!(
+                    !state.as_ref().is_some_and(|(_, result)| result.is_none()),
+                    "Another operation is running"
+                );
+                let id = fastrand::u64(..);
+                let action = value["action"].as_str().unwrap_or("unknown").to_owned();
+                record_task(id, &action, "running", None)?;
+                *state = Some((id, None));
+                let job = Arc::clone(job);
+                let task_token = token.to_owned();
+                std::thread::spawn(move || {
+                    super::command::BACKGROUND.with(|background| background.set(true));
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        if value["action"] == "core" {
+                            core::execute(value)
+                        } else {
+                            super::management::execute(value)
+                        }
+                    }));
+                    let mut result = match result {
+                        Ok(Ok(value)) => json!({"ok":true,"value":value}),
+                        Ok(Err(error)) => {
+                            json!({"ok":false,"error":format!("{error:#}").replace(&task_token, "[redacted]")})
+                        }
+                        Err(_) => {
+                            json!({"ok":false,"error":"Management task failed unexpectedly; refresh before retrying"})
+                        }
+                    };
+                    if let Err(error) = record_task(
+                        id,
+                        &action,
+                        if result["ok"] == true {
+                            "completed"
+                        } else {
+                            "failed"
+                        },
+                        Some(&result),
+                    ) {
+                        result = json!({"ok":false,"operation_result":result,"error":format!("Operation finished but its recovery record could not be saved: {}. Refresh before retrying.", format!("{error:#}").replace(&task_token, "[redacted]"))});
+                    }
+                    *job.lock().unwrap() = Some((id, Some(result)));
+                });
+                Ok(json!({"job":id.to_string()}))
+            })(),
+            _ => Err(anyhow::anyhow!("Route not found")),
+        };
+        match result {
+            Ok(value) => (200, "application/json", value.to_string()),
+            Err(error) => {
+                let message = error.to_string();
+                let status = if message.starts_with("Management state is busy") {
+                    503
+                } else if message.contains("Revision conflict") {
+                    409
+                } else if message == "Route not found" {
+                    404
+                } else {
+                    400
+                };
+                (
+                    status,
+                    "application/json",
+                    serde_json::json!({"error":message.replace(token, "[redacted]")}).to_string(),
+                )
+            }
+        }
+    };
+    let response = Response::from_string(body)
+        .with_status_code(StatusCode(status))
+        .with_header(Header::from_bytes("Content-Type", content_type).unwrap())
+        .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap())
+        .with_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap())
+        .with_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap())
+        .with_header(Header::from_bytes("X-Frame-Options", "DENY").unwrap());
+    let _ = request.respond(response);
 }
 
 fn recovered_result(record: &Value) -> Value {
