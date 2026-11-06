@@ -170,7 +170,7 @@ test("Runtime settings, persistence, DNS and browser preferences are usable", as
   page,
 }) => {
   await nav(page, "设置");
-  await page.getByLabel("mode", { exact: true }).selectOption("direct");
+  await page.getByLabel("代理模式", { exact: true }).selectOption("direct");
   await page.getByRole("button", { name: "应用运行设置", exact: true }).click();
   await expect.poll(() => f.state.mode).toBe("direct");
   await ready(page);
@@ -188,6 +188,33 @@ test("Runtime settings, persistence, DNS and browser preferences are usable", as
   await page.getByLabel("DNS 查询域名").fill("example.com");
   await page.getByRole("button", { name: "查询", exact: true }).click();
   await expect(page.locator("#resultContent")).toHaveValue(/192.0.2.1/);
+});
+test("TUN controls apply and persist the selected settings", async ({
+  page,
+}) => {
+  await nav(page, "设置");
+  const help = page.getByRole("img", { name: /TUN 模式说明/ });
+  await help.focus();
+  await expect(help).toBeFocused();
+  await expect
+    .poll(() => help.evaluate((el) => getComputedStyle(el, "::after").visibility))
+    .toBe("visible");
+  await page.getByLabel("启用 TUN 模式").check();
+  await page.getByLabel("网络栈").selectOption("system");
+  await page.getByRole("button", { name: "应用运行设置", exact: true }).click();
+  await expect
+    .poll(() => f.state.tun)
+    .toEqual({ enable: true, stack: "system" });
+  await ready(page);
+  answerDialog(page, (d) => d.accept());
+  await page
+    .getByRole("button", { name: "持久化运行设置", exact: true })
+    .click();
+  await expect(page.locator("#notice")).toHaveText("操作完成");
+  const override = (await f.json(["manage", "read", "--kind", "override"]))
+    .content;
+  expect(override).toMatch(/enable: true/);
+  expect(override).toMatch(/stack: system/);
 });
 test("Core maintenance reports success or the actual failure without a false success", async ({
   page,
@@ -412,7 +439,7 @@ test("Settings preserve unrelated client changes and reject conflicts on edited 
   page,
 }) => {
   await nav(page, "设置");
-  await page.getByLabel("log-level", { exact: true }).selectOption("warning");
+  await page.getByLabel("日志级别", { exact: true }).selectOption("warning");
   f.state.mode = "global";
   await page.getByRole("button", { name: "应用运行设置", exact: true }).click();
   await expect.poll(() => f.state["log-level"]).toBe("warning");
@@ -422,8 +449,8 @@ test("Settings preserve unrelated client changes and reject conflicts on edited 
     (r) => r.path === "/configs" && r.method === "PATCH",
   );
   expect(JSON.parse(patch.body)).toEqual({ "log-level": "warning" });
-  await page.getByLabel("log-level", { exact: true }).selectOption("debug");
-  await page.getByLabel("log-level", { exact: true }).selectOption("warning");
+  await page.getByLabel("日志级别", { exact: true }).selectOption("debug");
+  await page.getByLabel("日志级别", { exact: true }).selectOption("warning");
   const unchanged = f.requests.filter(
     (r) => r.path === "/configs" && r.method === "PATCH",
   ).length;
@@ -435,7 +462,7 @@ test("Settings preserve unrelated client changes and reject conflicts on edited 
   expect(
     f.requests.filter((r) => r.path === "/configs" && r.method === "PATCH"),
   ).toHaveLength(unchanged);
-  await page.getByLabel("log-level", { exact: true }).selectOption("debug");
+  await page.getByLabel("日志级别", { exact: true }).selectOption("debug");
   f.state["log-level"] = "error";
   const before = f.requests.filter(
     (r) => r.path === "/configs" && r.method === "PATCH",
@@ -447,7 +474,7 @@ test("Settings preserve unrelated client changes and reject conflicts on edited 
   expect(
     f.requests.filter((r) => r.path === "/configs" && r.method === "PATCH"),
   ).toHaveLength(before);
-  await expect(page.getByLabel("log-level", { exact: true })).toHaveValue(
+  await expect(page.getByLabel("日志级别", { exact: true })).toHaveValue(
     "debug",
   );
 });

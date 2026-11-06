@@ -24,7 +24,7 @@ async function service(action: string) {
                 ? "运行中"
                 : "已停止"
           }}
-          · 当前配置 {{ s.state?.current || "—" }}
+          · 当前配置 {{ s.state?.current || "未由 ClashTui 激活" }}
         </p>
       </div>
     </header>

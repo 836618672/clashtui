@@ -418,6 +418,60 @@ a {
 .form-grid > button {
   align-self: end;
 }
+.tun-settings {
+  margin-top: 20px;
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+.tun-settings h3 {
+  margin: 0 0 8px;
+}
+.tun-settings p {
+  margin: 0;
+}
+.setting-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.setting-help {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--muted);
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: help;
+}
+.setting-help::after {
+  content: attr(data-help);
+  position: absolute;
+  z-index: 10;
+  left: 0;
+  bottom: calc(100% + 8px);
+  width: min(260px, 65vw);
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+.setting-help:hover::after,
+.setting-help:focus::after {
+  opacity: 1;
+  visibility: visible;
+}
 .check {
   display: flex;
   flex-direction: row;

@@ -9,6 +9,13 @@ use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
 struct Fixture(PathBuf);
+
+#[test]
+fn state_reports_no_active_profile_without_a_placeholder_name() {
+    let fixture = Fixture::new();
+    assert!(fixture.run(&["manage", "state"])["current"].is_null());
+}
+
 impl Fixture {
     fn new() -> Self {
         use std::os::unix::fs::PermissionsExt;

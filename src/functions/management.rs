@@ -87,7 +87,7 @@ pub fn snapshot() -> Result<Value> {
     let db = std::fs::read(crate::config::config_dir_path().join("clashtui.db"))?;
     Ok(
         json!({"core": CONFIG.core_type().to_string(), "profiles": profiles,
-        "current": profile::db::get_current().name, "templates": template::get_all_templates()?,
+        "current": file::coordination::database().get_current().map(|profile| profile.name), "templates": template::get_all_templates()?,
         "revision": revision(&db), "service_running": crate::functions::command::is_core_service_running(),
         "dashboard": file::panel::deployment_state(), "system_proxy": system_proxy_state(), "service_install": cfg!(windows), "panel": file::panel::url()}),
     )

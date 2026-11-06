@@ -97,7 +97,7 @@ test('Two editors reject lost updates, invalid documents do not replace valid co
 test('Runtime patch/persist and override editing use shared state without service mutations', async ({page}) => {
   await connect(page); const row = await importProfile(page, 'runtime');
   await page.getByRole('link',{name:'设置',exact:true}).click();
-  await page.getByLabel('mode',{exact:true}).selectOption('direct');
+  await page.getByLabel('代理模式',{exact:true}).selectOption('direct');
   await page.getByRole('button',{name:'应用运行设置',exact:true}).click();
   await expect(page.locator('#refresh')).toBeEnabled();
   await expect(page.locator('#notice')).toHaveText('操作完成');

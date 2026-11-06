@@ -8,7 +8,7 @@ export interface Profile {
 }
 export interface State {
   core: string;
-  current: string;
+  current: string | null;
   revision: string;
   profiles: Profile[];
   templates: string[];

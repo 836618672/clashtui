@@ -35,7 +35,7 @@ const series = computed(() => [
       <div class="metric-heading">
         <small>当前配置</small><FileCheck2 :size="18" />
       </div>
-      <strong id="currentProfile">{{ s.state?.current || "未激活" }}</strong
+      <strong id="currentProfile">{{ s.state?.current || "未由 ClashTui 激活" }}</strong
       ><span>Mihomo {{ version }}</span>
     </div>
     <div class="card metric">
