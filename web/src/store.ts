@@ -1,6 +1,15 @@
 import { defineStore } from "pinia";
 import { ref, computed } from "vue";
-import type { State, Json, StreamState, Document } from "./types";
+import type {
+  State,
+  Json,
+  StreamState,
+  Document,
+  JobSnapshot,
+  ActionResult,
+  CoreResponses,
+} from "./types";
+import { jobSnapshot, coreResponse } from "./contracts";
 const sessionTokenKey = "clashtui.management-token";
 function loadSessionToken() {
   try {
@@ -35,7 +44,7 @@ export const useWorkspace = defineStore("workspace", () => {
     session = ref(0);
   const result = ref<{ title: string; value: Json }>(),
     document = ref<Document>(),
-    lastJob = ref<Json>();
+    lastJob = ref<JobSnapshot>();
   const streams = ref<StreamState>({
     traffic: null,
     memory: null,
@@ -125,13 +134,13 @@ export const useWorkspace = defineStore("workspace", () => {
     const generation = session.value;
     connecting.value = true;
     try {
-      let job = await api("/api/job");
+      let job = jobSnapshot(await api("/api/job"));
       while (job.pending) {
         notice("已连接管理服务，等待已有任务完成；不会重复执行");
         await new Promise((r) => setTimeout(r, 300));
         if (generation !== session.value)
           throw new SessionChanged("会话已改变");
-        job = await api("/api/job");
+        job = jobSnapshot(await api("/api/job"));
       }
       lastJob.value = job.id ? job : undefined;
       state.value = await api<State>("/api/state");
@@ -153,9 +162,12 @@ export const useWorkspace = defineStore("workspace", () => {
     const next = await api<State>("/api/state");
     state.value = next;
   }
-  async function action(action: string, extra: Json = {}): Promise<Json> {
+  async function action(
+    action: string,
+    extra: object = {},
+  ): Promise<ActionResult> {
     const generation = session.value;
-    let value = await api("/api/action", {
+    let value = await api<ActionResult & { job?: string }>("/api/action", {
       action,
       core: state.value?.core,
       revision: state.value?.revision,
@@ -167,7 +179,7 @@ export const useWorkspace = defineStore("workspace", () => {
         await new Promise((r) => setTimeout(r, 300));
         if (generation !== session.value)
           throw new SessionChanged("会话已改变");
-        const job = await api("/api/job");
+        const job = jobSnapshot(await api("/api/job"));
         lastJob.value = job;
         if (job.id !== value.job)
           throw new Error("任务已被另一客户端替换，请刷新核对");
@@ -195,7 +207,7 @@ export const useWorkspace = defineStore("workspace", () => {
       const value = await work();
       if (generation !== session.value) return;
       if (show) result.value = { title: show, value };
-      if ((value as Json)?.partial_failure) {
+      if ((value as ActionResult | undefined)?.partial_failure) {
         notice("部分操作失败，请查看逐项结果", "error");
         result.value = { title: show || "部分失败", value };
       } else notice("操作完成", "success");
@@ -207,15 +219,18 @@ export const useWorkspace = defineStore("workspace", () => {
       if (generation === session.value) busy.value = false;
     }
   }
-  async function readCore(view: string, extra: Json = {}) {
-    return api("/api/core/read", { view, ...extra });
+  async function readCore<K extends keyof CoreResponses>(
+    view: K,
+    extra: object = {},
+  ): Promise<CoreResponses[K]> {
+    return coreResponse(view, await api("/api/core/read", { view, ...extra }));
   }
-  async function core(operation: string, extra: Json = {}) {
+  async function core(operation: string, extra: object = {}) {
     return action("core", { operation, ...extra });
   }
   async function edit(kind: Document["kind"], name = "") {
     const generation = session.value;
-    const doc = await api("/api/action", {
+    const doc = await api<ActionResult & { job?: string }>("/api/action", {
       action: "read",
       core: state.value?.core,
       kind,
@@ -227,17 +242,20 @@ export const useWorkspace = defineStore("workspace", () => {
         await new Promise((r) => setTimeout(r, 300));
         if (generation !== session.value)
           throw new SessionChanged("会话已改变");
-        const job = await api("/api/job");
+        const job = jobSnapshot(await api("/api/job"));
         lastJob.value = job;
         if (job.id !== doc.job) throw new Error("任务已被替换");
         if (!job.pending) {
-          if (!job.result.ok) throw new Error(job.result.error);
+          if (!job.result?.ok)
+            throw new Error(job.result?.error || "任务执行失败");
           value = job.result.value;
           break;
         }
       }
     }
     if (generation !== session.value) throw new SessionChanged("会话已改变");
+    if (typeof value.revision !== "string" || typeof value.content !== "string")
+      throw new Error("文件响应缺少修订号或内容");
     document.value = {
       kind,
       name,
@@ -250,6 +268,8 @@ export const useWorkspace = defineStore("workspace", () => {
     if (!document.value) return;
     const doc = document.value;
     const value = await action("save", doc);
+    if (typeof value.revision !== "string")
+      throw new Error("保存响应缺少修订号");
     doc.revision = value.revision;
   }
   function show(title: string, value: Json) {

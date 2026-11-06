@@ -1,12 +1,11 @@
-import type { Json } from "./types";
 // Compare against the edit baseline, rather than a background refresh.
 export function settingsPatch(
-  baseline: Json,
-  draft: Json,
+  baseline: Record<string, unknown>,
+  draft: Record<string, unknown>,
   available: string[],
 ) {
-  const patch: Json = {},
-    expected: Json = {};
+  const patch: Record<string, unknown> = {},
+    expected: Record<string, unknown> = {};
   for (const field of available) {
     const raw = draft[field];
     const value =

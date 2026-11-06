@@ -141,7 +141,7 @@ describe("management session boundaries", () => {
       results: [{ ok: false }],
     }));
     expect(s.messageKind).toBe("error");
-    expect(s.result?.value.results[0].ok).toBe(false);
+    expect(s.result?.value).toMatchObject({ results: [{ ok: false }] });
   });
   it("rejects API results from a different credential even before authentication", async () => {
     const s = useWorkspace();
@@ -298,7 +298,10 @@ describe("background management jobs", () => {
       },
       "activation failed",
     ],
-    [{ id: "another-job", pending: false }, "任务已被另一客户端替换"],
+    [
+      { id: "another-job", pending: false, result: { ok: true, value: {} } },
+      "任务已被另一客户端替换",
+    ],
   ])(
     "rejects a failed or replaced job without refreshing state",
     async (job, error) => {
@@ -333,7 +336,11 @@ describe("background management jobs", () => {
     vi.mocked(fetch)
       .mockResolvedValueOnce(response({ id: "existing", pending: true }))
       .mockResolvedValueOnce(
-        response({ id: "existing", pending: false, result: { ok: false } }),
+        response({
+          id: "existing",
+          pending: false,
+          result: { ok: false, error: "interrupted" },
+        }),
       )
       .mockResolvedValueOnce(response({ core: "mihomo" }));
     const pending = s.connect();
@@ -375,7 +382,9 @@ describe("background snapshots", () => {
           : {
               reset,
               generation: reset ? "new" : "old",
-              logs: [{ id: 1001 }],
+              logs: [
+                { id: 1001, time: 0, value: { type: "info", payload: "new" } },
+              ],
               cursor: 1001,
               traffic: { up: 0 },
               memory: null,
@@ -392,7 +401,9 @@ describe("background snapshots", () => {
     expect(s.samples.at(-1)).toMatchObject({ up: 0, down: null, memory: null });
     reset = true;
     await s.poll();
-    expect(s.streams.logs).toEqual([{ id: 1001 }]);
+    expect(s.streams.logs).toEqual([
+      { id: 1001, time: 0, value: { type: "info", payload: "new" } },
+    ]);
     expect(s.samples).toHaveLength(1);
   });
 });

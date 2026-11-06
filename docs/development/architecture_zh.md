@@ -19,6 +19,8 @@
 
 Web 构建和接口边界见 [Vue 管理面板](web_dashboard_zh.md)；测试执行见[测试入口](../testing/README.md)。前端改动先重建 `web/dist/`，再编译 Rust。
 
+Web 的 HTTP 分派保留在 `src/functions/web.rs`，令牌文件与认证在 `web/auth.rs`，任务状态、持久化及恢复在 `web/jobs.rs`，核心适配与实时缓存在 `web/core.rs`。前端 `contracts.ts` 在关键响应入口校验数据，`types.ts` 描述接口结构。
+
 ## 技术栈
 
 - 语言：Rust（Edition 2024）

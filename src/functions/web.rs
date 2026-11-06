@@ -1,36 +1,16 @@
 //! Authenticated core dashboard and local Profile/template/service workflows.
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{Value, json};
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tiny_http::{Header, Response, Server, StatusCode};
+mod auth;
 mod core;
-type JobState = Arc<Mutex<Option<(u64, Option<Value>)>>>;
-
-fn record_task(id: u64, action: &str, state: &str, result: Option<&Value>) -> Result<()> {
-    let value = json!({"id":id.to_string(),"action":action,"state":state,"result":result});
-    let path = crate::config::config_dir_path().join(".web-task.json");
-    if let Ok(metadata) = std::fs::symlink_metadata(&path) {
-        anyhow::ensure!(
-            metadata.is_file() && !metadata.file_type().is_symlink(),
-            "Task recovery record must be a regular file"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-    }
-    super::file::activation::atomic_write(&path, value.to_string().as_bytes())
-}
-
-fn authorized(headers: &[Header], token: &str) -> bool {
-    headers
-        .iter()
-        .any(|h| h.field.equiv("Authorization") && h.value.as_str() == format!("Bearer {token}"))
-}
+mod jobs;
+use auth::authorized;
+type JobState = Arc<Mutex<Option<jobs::Job>>>;
 
 pub fn serve(listen: SocketAddr, token_file: &Path) -> Result<()> {
     super::command::BACKGROUND.with(|background| background.set(true));
@@ -38,23 +18,11 @@ pub fn serve(listen: SocketAddr, token_file: &Path) -> Result<()> {
         listen.ip().is_loopback(),
         "The management companion must listen on a loopback address; use an authenticated TLS reverse proxy for remote access"
     );
-    let token = std::fs::read_to_string(token_file).context("Read management token file")?;
-    let token = token.trim();
-    anyhow::ensure!(
-        token.len() >= 24 && !token.chars().any(char::is_whitespace),
-        "Use a management token with at least 24 characters and no whitespace"
-    );
+    let token = auth::load_token(token_file)?;
     let server = Server::http(listen).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let job: JobState = Arc::default();
+    let task_path = crate::config::config_dir_path().join(".web-task.json");
+    let job: JobState = Arc::new(Mutex::new(jobs::Job::load(&task_path)?));
     let streams = core::Streams::start();
-    if let Ok(bytes) = std::fs::read(crate::config::config_dir_path().join(".web-task.json"))
-        && let Ok(previous) = serde_json::from_slice::<Value>(&bytes)
-        && let Some(id) = previous["id"]
-            .as_str()
-            .and_then(|id| id.parse::<u64>().ok())
-    {
-        *job.lock().unwrap() = Some((id, Some(recovered_result(&previous))));
-    }
     eprintln!("Management companion: http://{listen}/ (ClashTui Vue dashboard)");
     // Slow core reads have a bounded pool; local state, jobs and actions keep
     // their own dispatch lane even when every read worker is waiting on Mihomo.
@@ -79,7 +47,7 @@ pub fn serve(listen: SocketAddr, token_file: &Path) -> Result<()> {
     for request in server.incoming_requests() {
         if request.method().as_str() == "POST"
             && request.url() == "/api/core/read"
-            && authorized(request.headers(), token)
+            && authorized(request.headers(), &token)
         {
             if let Err(error) = send.try_send(request) {
                 let request = match error {
@@ -96,7 +64,7 @@ pub fn serve(listen: SocketAddr, token_file: &Path) -> Result<()> {
                 );
             }
         } else {
-            handle_request(request, token, &job, &streams);
+            handle_request(request, &token, &job, &streams);
         }
     }
     Ok(())
@@ -124,18 +92,11 @@ fn handle_request(
     } else {
         let result = match (request.method().as_str(), request.url()) {
             ("GET", "/api/job") => Ok(match job.lock().unwrap().as_ref() {
-                Some((id, result)) => {
-                    json!({"id":id.to_string(),"pending":result.is_none(),"result":result})
-                }
+                Some(job) => job.snapshot(),
                 None => json!({"pending":false}),
             }),
             ("GET", "/api/state") => {
-                if job
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .is_some_and(|(_, result)| result.is_none())
-                {
+                if job.lock().unwrap().as_ref().is_some_and(jobs::Job::pending) {
                     Err(anyhow::anyhow!(
                         "Management operation is running; wait for its result"
                     ))
@@ -160,48 +121,40 @@ fn handle_request(
                     "Request exceeds 2 MiB limit"
                 );
                 let value: Value = serde_json::from_slice(&bytes)?;
+                anyhow::ensure!(
+                    value.is_object() && value["action"].as_str().is_some_and(|a| !a.is_empty()),
+                    "Request must be an object with an action"
+                );
                 let mut state = job.lock().unwrap();
                 anyhow::ensure!(
-                    !state.as_ref().is_some_and(|(_, result)| result.is_none()),
+                    !state.as_ref().is_some_and(jobs::Job::pending),
                     "Another operation is running"
                 );
-                let id = fastrand::u64(..);
                 let action = value["action"].as_str().unwrap_or("unknown").to_owned();
-                record_task(id, &action, "running", None)?;
-                *state = Some((id, None));
+                let mut task = jobs::Job::running(&action);
+                let id = task.id.clone();
+                let path = crate::config::config_dir_path().join(".web-task.json");
+                task.save(&path)?;
+                *state = Some(task.clone());
                 let job = Arc::clone(job);
                 let task_token = token.to_owned();
                 std::thread::spawn(move || {
                     super::command::BACKGROUND.with(|background| background.set(true));
-                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        if value["action"] == "core" {
-                            core::execute(value)
-                        } else {
-                            super::management::execute(value)
-                        }
-                    }));
-                    let mut result = match result {
-                        Ok(Ok(value)) => json!({"ok":true,"value":value}),
-                        Ok(Err(error)) => {
-                            json!({"ok":false,"error":format!("{error:#}").replace(&task_token, "[redacted]")})
-                        }
-                        Err(_) => {
-                            json!({"ok":false,"error":"Management task failed unexpectedly; refresh before retrying"})
-                        }
-                    };
-                    if let Err(error) = record_task(
-                        id,
-                        &action,
-                        if result["ok"] == true {
-                            "completed"
-                        } else {
-                            "failed"
+                    let result = jobs::execute(
+                        || {
+                            if value["action"] == "core" {
+                                core::execute(value)
+                            } else {
+                                super::management::execute(value)
+                            }
                         },
-                        Some(&result),
-                    ) {
-                        result = json!({"ok":false,"operation_result":result,"error":format!("Operation finished but its recovery record could not be saved: {}. Refresh before retrying.", format!("{error:#}").replace(&task_token, "[redacted]"))});
+                        &task_token,
+                    );
+                    task.finish(result);
+                    if let Err(error) = task.save(&path) {
+                        task.finish(json!({"ok":false,"code":"recovery_save_failed","operation_result":task.result,"error":format!("Operation finished but its recovery record could not be saved: {}. Refresh before retrying.", format!("{error:#}").replace(&task_token, "[redacted]"))}));
                     }
-                    *job.lock().unwrap() = Some((id, Some(result)));
+                    *job.lock().unwrap() = Some(task);
                 });
                 Ok(json!({"job":id.to_string()}))
             })(),
@@ -211,7 +164,13 @@ fn handle_request(
             Ok(value) => (200, "application/json", value.to_string()),
             Err(error) => {
                 let message = error.to_string();
-                let status = if message.starts_with("Management state is busy") {
+                let status = if message.starts_with("Request exceeds") {
+                    413
+                } else if message == "Another operation is running" {
+                    409
+                } else if message.starts_with("Management state is busy")
+                    || message.starts_with("Management operation is running")
+                {
                     503
                 } else if message.contains("Revision conflict") {
                     409
@@ -236,34 +195,4 @@ fn handle_request(
         .with_header(Header::from_bytes("Referrer-Policy", "no-referrer").unwrap())
         .with_header(Header::from_bytes("X-Frame-Options", "DENY").unwrap());
     let _ = request.respond(response);
-}
-
-fn recovered_result(record: &Value) -> Value {
-    if matches!(record["state"].as_str(), Some("completed" | "failed"))
-        && record["result"].is_object()
-    {
-        record["result"].clone()
-    } else {
-        json!({"ok":false,"error":"Management server restarted during a task; refresh and check the current state before retrying"})
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn restart_restores_completed_outcomes_without_replaying_pending_tasks() {
-        let success = json!({"state":"completed","result":{"ok":true,"value":{"name":"new"}}});
-        assert_eq!(recovered_result(&success), success["result"]);
-        let failure = json!({"state":"failed","result":{"ok":false,"error":"validation failed"}});
-        assert_eq!(recovered_result(&failure), failure["result"]);
-        assert_eq!(recovered_result(&json!({"state":"running"}))["ok"], false);
-    }
-    #[test]
-    fn core_secret_is_not_an_alternative_to_management_auth() {
-        let headers = vec![Header::from_bytes("Authorization", "Bearer core-secret").unwrap()];
-        assert!(!authorized(&headers, "independent-management-token"));
-        assert!(authorized(&headers, "core-secret"));
-        assert!(!authorized(&[], "core-secret"));
-    }
 }

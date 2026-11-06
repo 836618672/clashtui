@@ -1,9 +1,10 @@
 <script setup lang="ts">
+import type { Proxy } from "../types";
 import { ref, computed } from "vue";
 import { useWorkspace, searchable } from "../store";
 import { useLive } from "../live";
 const s = useWorkspace(),
-  proxies = ref<Record<string, any>>({}),
+  proxies = ref<Record<string, Proxy>>({}),
   filter = ref(""),
   sort = ref("name"),
   layout = ref("grid"),
@@ -21,8 +22,8 @@ const standalone = computed(() =>
     ([n, v]) => !v.all && searchable([n, v], filter.value),
   ),
 );
-function members(v: any) {
-  return [...v.all]
+function members(v: Proxy) {
+  return [...(v.all || [])]
     .filter(
       (n: string) =>
         !filter.value ||
@@ -48,7 +49,7 @@ async function test(name: string, group = false) {
     timeout: s.prefs.delayTimeout,
   });
   if (group) Object.assign(delay.value, r);
-  else delay.value[name] = r.delay;
+  else if (typeof r.delay === "number") delay.value[name] = r.delay;
   await refresh();
 }
 </script>
@@ -72,7 +73,7 @@ async function test(name: string, group = false) {
     <header>
       <div>
         <h2>{{ name }}</h2>
-        <p>{{ g.type }} · 当前 {{ g.now }} · {{ g.all.length }} 个节点</p>
+        <p>{{ g.type }} · 当前 {{ g.now }} · {{ g.all?.length }} 个节点</p>
       </div>
       <div class="actions">
         <button :disabled="s.busy" @click="s.run(() => test(name, true))">

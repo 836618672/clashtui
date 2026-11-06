@@ -54,6 +54,10 @@ impl Fixture {
     fn file(&self, name: &str, content: &str) -> String {
         let path = self.0.join(name);
         std::fs::write(&path, content).unwrap();
+        if name == "management-token" {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         path.to_str().unwrap().to_owned()
     }
 }

@@ -23,6 +23,7 @@ export async function fixture() {
   const connections = ['match / 中文','keep'].map((id,i)=>({id,metadata:{network:'tcp',type:'HTTP',host:i?'keep.test':'match.test',sourceIP:'127.0.0.1',sourcePort:'12345',process:i?'keep':'worker',extraField:'preserved'},upload:10,download:20,start:'2026-01-01T00:00:00Z',chains:[group],rule:'Match',opaque:{keep:true}}));
   const faults = new Map();
   const delays = new Map();
+  const gates = new Map();
   const core = createServer(async (req,res)=>{
     let body=''; for await(const chunk of req) body+=chunk;
     const url = new URL(req.url,'http://localhost');
@@ -32,6 +33,7 @@ export async function fixture() {
     if(path==='/subscription') return send({proxies:[]});
     if(req.headers.authorization!==`Bearer ${secret}`) return send({error:'auth'},401);
     if(faults.has(path)) return send({error:`mock HTTP ${faults.get(path)}`},faults.get(path));
+    if(gates.has(path)) await gates.get(path);
     if(delays.has(path)) await new Promise(resolve=>setTimeout(resolve,delays.get(path)));
     if(path==='/dns/query') return send({Question:[{Name:url.searchParams.get('name'),Type:url.searchParams.get('type')}],Answer:[{Data:'192.0.2.1'}]});
     if(path==='/version') return send(backend);
@@ -98,5 +100,5 @@ export async function fixture() {
   async function restartWeb(){web.kill('SIGTERM');await once(web,'close');return startWeb();}
   function disconnectStreams(){for(const socket of sockets)socket.destroy();}
   function emitLog(value){const payload=Buffer.from(JSON.stringify(value));const header=payload.length<126?Buffer.from([0x81,payload.length]):Buffer.from([0x81,126,payload.length>>8,payload.length&255]);for(const socket of sockets)if(socket.streamPath.startsWith('/logs'))socket.write(Buffer.concat([header,payload]));}
-  return {root,binary,secret,endpoint,state,backend,group,node,provider,requests,connections,rules,faults,delays,start,run,json,startWeb,close,restartWeb,disconnectStreams,emitLog};
+  return {root,binary,secret,endpoint,state,backend,group,node,provider,requests,connections,rules,faults,delays,gates,start,run,json,startWeb,close,restartWeb,disconnectStreams,emitLog};
 }

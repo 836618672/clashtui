@@ -49,7 +49,7 @@ meta.stdout.on('data',chunk=>metadata+=chunk);meta.stderr.resume();
 const metaExit=await new Promise((resolve,reject)=>{meta.once('error',reject);meta.once('exit',resolve);}).catch(()=>-1);
 if(metaExit===0)env.CLASHTUI_TEST_BINARY=join(JSON.parse(metadata).target_directory,'debug',process.platform==='win32'?'clashtui.exe':'clashtui');
 const buildFailed=results.some(row=>row.name==='build-tui'&&row.status!=='passed');
-await stage('core-cli-mocks',process.execPath,['--test','tests/pipeline/core.test.mjs'],{skip:process.platform!=='linux'?'Linux process fixture only':buildFailed?'TUI binary build failed':undefined});
+await stage('core-cli-mocks',process.execPath,['--test','tests/pipeline/core.test.mjs','tests/pipeline/web-api.test.mjs'],{skip:process.platform!=='linux'?'Linux process fixture only':buildFailed?'TUI binary build failed':undefined});
 await stage('tui-pty',process.execPath,['--test','tests/pipeline/tui.test.mjs'],{skip:process.platform!=='linux'?'Linux PTY fixture only':buildFailed?'TUI binary build failed':undefined});
 await stage('browser','npm',['--prefix','tests/browser','test'],{skip:!options.has('--browser')?'Opt in with --browser after installing Playwright':process.platform!=='linux'?'Linux fixture only':buildFailed?'TUI binary build failed':undefined});
 results.push({name:'real-core-and-platform',status:'skipped',reason:'Requires isolated VM acceptance; never enabled by the default pipeline'});

@@ -1,22 +1,6 @@
 name: Install Test
 
 on:
-  push:
-    branches:
-      - main
-      - dev
-    paths:
-      - 'installs/**'
-      - 'contrib/**'
-      - '.github/workflows/install_test.yml'
-  pull_request:
-    branches:
-      - main
-      - dev
-    paths:
-      - 'installs/**'
-      - 'contrib/**'
-      - '.github/workflows/install_test.yml'
   workflow_dispatch:
     inputs:
       repo:

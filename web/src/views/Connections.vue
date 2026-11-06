@@ -1,13 +1,14 @@
 <script setup lang="ts">
+import type { Connections } from "../types";
 import { confirm } from "../dialog";
 import { ref, computed } from "vue";
 import { useWorkspace, searchable, bytes, download } from "../store";
 import { useLive } from "../live";
 const s = useWorkspace(),
-  data = ref<any>({ connections: [] }),
+  data = ref<Connections>({ connections: [] }),
   filter = ref(""),
   paused = ref(false),
-  sort = ref("download"),
+  sort = ref<"download" | "upload" | "host">("download"),
   selected = ref<string[]>([]);
 const { error, refresh } = useLive(async () => {
   if (!paused.value) data.value = await s.readCore("connections");
@@ -20,7 +21,8 @@ const rows = computed(() =>
         ? String(a.metadata?.host || "").localeCompare(
             String(b.metadata?.host || ""),
           )
-        : (b[sort.value] || 0) - (a[sort.value] || 0),
+        : (b[sort.value as "download" | "upload"] || 0) -
+          (a[sort.value as "download" | "upload"] || 0),
     ),
 );
 async function close(ids: string[]) {

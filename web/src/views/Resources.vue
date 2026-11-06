@@ -27,7 +27,7 @@ async function operate(name: string, resource_action = "update") {
     name,
     resource_action,
   });
-  rows.value = r.current;
+  if (r.current) rows.value = r.current;
   return r;
 }
 async function providerNode(provider: string, node: string) {

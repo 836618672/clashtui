@@ -180,7 +180,7 @@ async function act(p: Profile, action: string) {
     if (result.partial_failure) throw new Error("部分订阅资源更新失败");
     if (action === "profile_url") {
       try {
-        await navigator.clipboard.writeText(result.url);
+        await navigator.clipboard.writeText(result.url || "");
       } catch {
         s.show("请手动复制 URL", result.url);
         throw new Error("浏览器未允许复制，请从结果中手动复制");
@@ -220,7 +220,7 @@ const actions = [
             if (await confirm('更新全部配置？当前配置可能重新激活。')) {
               const r = await s.action('update_all');
               s.show('批量更新结果', r);
-              if (r.results.some((x: any) => !x.ok))
+              if (r.results?.some((x) => !x.ok))
                 throw new Error('部分配置更新失败');
             }
           })

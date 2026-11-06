@@ -29,7 +29,7 @@ describe("runtime edit baseline", () => {
       { ...baseline, tun: '{"enable":true,"stack":"mixed"}' },
       ["tun"],
     );
-    expect(result.patch.tun.enable).toBe(true);
+    expect(result.patch.tun).toEqual({ enable: true, stack: "mixed" });
     expect(result.expected.tun).toEqual(baseline.tun);
     expect(() =>
       settingsPatch(baseline, { tun: "{invalid" }, ["tun"]),

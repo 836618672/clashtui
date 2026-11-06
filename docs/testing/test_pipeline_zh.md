@@ -107,3 +107,13 @@ cargo test --all-features
 本页描述 A 层。正式验收使用 `bash scripts/acceptance.sh`，将 A、安装器、真实 B/C、现场归档、最终恢复和宿主对照串联。完整映射与跳过边界见[覆盖契约](acceptance_coverage_zh.md)，操作见[测试方案](README.md)。
 
 最新完整 A/B/C 结果为[2026-10-02 C 层验收报告](reports/c_acceptance_20261002_zh.md)：真实 VM 64 组通过、0 失败、1 项核心能力跳过；30 组新增 C 用例全部通过，源码和宿主对照及恢复通过。
+
+## Web 异常与恢复回归
+
+`tests/pipeline/web-api.test.mjs` 已纳入默认隔离接口阶段，使用临时目录和模拟核心，覆盖非法 JSON/请求形状、64 KiB 与 2 MiB 精确边界、并发动作独占、任务期间查询、旧 running 恢复为 interrupted、损坏记录保留、核心不可用以及 4 线程/16 等待项拥堵。直接重跑：
+
+```bash
+node --test tests/pipeline/web-api.test.mjs
+```
+
+Rust 的 `web/auth.rs` 检查令牌文件缺失、权限、符号链接和内容边界；`web/jobs.rs` 检查 panic 捕获、结果脱敏、完成/失败持久化、旧格式兼容、中断恢复及非法记录。前端 `contracts.test.ts` 检查任务结果及节点/连接响应格式，并确认未知字段保留。

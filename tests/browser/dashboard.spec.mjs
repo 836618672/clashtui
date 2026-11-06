@@ -19,10 +19,14 @@ test.beforeEach(async ({ context, page }) => {
   await expect(page.locator("#main")).toBeVisible();
 });
 test.afterEach(async ({ context }) => {
-  await context.unrouteAll({ behavior: "wait" });
-  await Promise.all(context.pages().map(finishDialogs));
-  await Promise.all(context.pages().map((p) => p.close()));
-  if (f) await f.close();
+  try {
+    await context.unrouteAll({ behavior: "wait" });
+    await Promise.all(context.pages().map(finishDialogs));
+    await Promise.all(context.pages().map((p) => p.close()));
+  } finally {
+    if (f) await f.close();
+    f = undefined;
+  }
 });
 const nav = (page, name) =>
   page.getByRole("link", { name, exact: true }).click();

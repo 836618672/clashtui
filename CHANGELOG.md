@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Redesign the local management page with navigation, live overview cards, responsive configuration lists and dedicated document/result sections; clarify management token and panel secret usage.
 
 ### Fixed
+- Make interrupted Web tasks explicit, preserve damaged recovery records, and report request size/concurrency failures with appropriate HTTP statuses.
+- Require private regular management token files and validate critical frontend response shapes; remove unused TUI popup code.
 - Persist validated Web sessions across reloads; keep notifications visible, chart legends clear, and stale async results out of newer sessions.
 - Explain subscription validation/timeouts, allow direct or proxy downloads, and normalize Mihomo IPv6/GeoIP activation readback.
 - Provider path validation, text/MRS rule handling, subscription failure reporting, empty group fallback and read-only database revision changes.

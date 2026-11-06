@@ -19,6 +19,8 @@ This document describes the code architecture of Clashtui for developers to unde
 
 See the [Vue dashboard guide (Chinese)](web_dashboard_zh.md) for frontend builds and API boundaries, and the [test entry point (Chinese)](../testing/README.md). Rebuild `web/dist/` before compiling Rust after frontend changes.
 
+HTTP dispatch remains in `src/functions/web.rs`; `web/auth.rs` owns credentials, `web/jobs.rs` owns task lifecycle and recovery, and `web/core.rs` adapts core APIs and streams. Frontend `contracts.ts` validates critical response boundaries and `types.ts` describes the interfaces.
+
 ## Tech Stack
 
 - Language: Rust (Edition 2024)

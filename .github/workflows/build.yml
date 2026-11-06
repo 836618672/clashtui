@@ -1,17 +1,6 @@
 name: Build
 
 on:
-  push:
-    branches:
-      - main
-      - dev
-    paths:
-      - '.github/workflows/build.yml'
-      - 'src/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'build.rs'
-
   workflow_dispatch:
 
 env:
