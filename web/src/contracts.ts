@@ -84,15 +84,18 @@ export function coreResponse<K extends keyof CoreResponses>(
     }
   } else if (view === "connections") {
     requireShape(
-      object(value) && Array.isArray(value.connections),
+      object(value) &&
+        (value.connections === null || Array.isArray(value.connections)),
       "连接列表缺失",
     );
+    // Mihomo serializes its empty connection slice as null.
+    const connections = value.connections ?? [];
     for (const field of ["uploadTotal", "downloadTotal"])
       requireShape(
         value[field] == null || typeof value[field] === "number",
         "连接总流量无效",
       );
-    for (const connection of value.connections) {
+    for (const connection of connections) {
       requireShape(
         object(connection) && typeof connection.id === "string",
         "连接编号缺失",
@@ -114,6 +117,7 @@ export function coreResponse<K extends keyof CoreResponses>(
           "连接流量无效",
         );
     }
+    if (value.connections === null) value = { ...value, connections };
   } else if (view === "streams") {
     requireShape(
       object(value) &&
@@ -135,8 +139,6 @@ export function coreResponse<K extends keyof CoreResponses>(
             "实时指标值无效",
           );
     }
-    if (value.connections != null)
-      coreResponse("connections", value.connections);
     for (const row of value.logs)
       requireShape(
         object(row) &&
@@ -147,6 +149,10 @@ export function coreResponse<K extends keyof CoreResponses>(
           typeof row.value.payload === "string",
         "日志记录无效",
       );
+    if (value.connections != null) {
+      const connections = coreResponse("connections", value.connections);
+      if (connections !== value.connections) value = { ...value, connections };
+    }
   }
   return value as CoreResponses[K];
 }

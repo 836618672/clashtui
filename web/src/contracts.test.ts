@@ -81,6 +81,19 @@ describe("API contracts", () => {
     ])
       expect(() => coreResponse("streams", value)).toThrow();
   });
+  it("accepts Mihomo's null connection list in reads and live snapshots", () => {
+    const idle = { connections: null, uploadTotal: 100, downloadTotal: 200 };
+    const snapshot = { logs: [], cursor: 0, status: {}, connections: idle };
+    expect(coreResponse("connections", idle)).toEqual({
+      ...idle,
+      connections: [],
+    });
+    expect(coreResponse("streams", snapshot)).toEqual({
+      ...snapshot,
+      connections: { ...idle, connections: [] },
+    });
+    expect(snapshot.connections.connections).toBeNull();
+  });
   it("keeps unknown connection metadata and rejects unsafe list or traffic shapes", () => {
     const response = {
       connections: [
